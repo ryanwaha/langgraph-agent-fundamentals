@@ -17,6 +17,9 @@ langgraph dev --no-browser
 
 # Start Discord bot
 python -m bot.discord_bot
+
+# Start Telegram bot
+python -m bot.telegram_bot
 ```
 
 > **Windows encoding**: `.env` must use ASCII-only comments (no em dashes `—`). The `langgraph dev` dotenv parser uses the system codepage (cp950 on this machine).
@@ -26,12 +29,14 @@ python -m bot.discord_bot
 ### Two-layer design
 
 ```
-Discord (bot/discord_bot.py)
-    ↓  graph.ainvoke(InputState(...), config=RunnableConfig(...), context=Context())
-LangGraph ReAct Agent (src/agent/)
+Discord  (bot/discord_bot.py)  ─┐
+                                 ├─ graph.ainvoke(InputState(...), config=RunnableConfig(...), context=Context())
+Telegram (bot/telegram_bot.py) ─┘
+                                 ↓
+                    LangGraph ReAct Agent (src/agent/)
 ```
 
-The Discord layer and the agent are fully decoupled — `graph.ainvoke()` can be called from any frontend.
+The bot layers and the agent are fully decoupled — `graph.ainvoke()` can be called from any frontend.
 
 ### Agent internals (`src/agent/`)
 
@@ -64,6 +69,10 @@ Decorating with `@register_tool` is all that's needed — the tool is automatica
 
 Each Discord channel gets its own `thread_id = str(message.channel.id)`. Enabling per-channel conversation memory only requires adding a checkpointer to `graph.compile()` in `graph.py`.
 
+### Telegram chat isolation
+
+Each Telegram chat gets its own `thread_id = str(message.chat_id)`. Private chats use the user's chat ID; group chats use the group's chat ID. Enabling per-chat conversation memory requires the same checkpointer change in `graph.py`.
+
 ## Key dependencies
 
 | Package | Purpose |
@@ -72,6 +81,7 @@ Each Discord channel gets its own `thread_id = str(message.channel.id)`. Enablin
 | `langchain-google-genai>=4.2.1` | Gemini model support |
 | `langchain-tavily>=0.2.17` | Web search tool |
 | `discord.py>=2.7.1` | Discord gateway client |
+| `python-telegram-bot>=20.0` | Telegram async bot client |
 | `langgraph-cli[inmem]` | `langgraph dev` Studio server |
 
 Default model: `google_genai/gemini-2.5-flash-lite` (set via `MODEL` in `.env`).

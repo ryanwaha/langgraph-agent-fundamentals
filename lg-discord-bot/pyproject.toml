@@ -9,6 +9,7 @@ dependencies = [
     "langchain-google-genai>=4.2.1",
     "langchain-tavily>=0.1",
     "discord.py>=2.7.1",
+    "python-telegram-bot>=20.0",
     "python-dotenv>=1.0.1",
 ]
 
@@ -27,3 +28,4 @@ packages = ["agent"]
 
 [project.scripts]
 discord-bot = "bot.discord_bot:main"
+telegram-bot = "bot.telegram_bot:main"

@@ -13,5 +13,8 @@ langchain-tavily>=0.2.17
 # Discord
 discord.py>=2.7.1
 
+# Telegram
+python-telegram-bot>=20.0
+
 # Utils
 python-dotenv>=1.0.1
