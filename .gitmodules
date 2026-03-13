@@ -1,0 +1,3 @@
+[submodule "src/jsonl-dag-engine"]
+	path = src/jsonl-dag-engine
+	url = https://github.com/ryanwaha/JSONL-DAG-engine.git
