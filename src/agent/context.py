@@ -8,6 +8,9 @@ from typing import Annotated
 
 from . import prompts
 
+# Fields that are set programmatically per-request, not from env vars.
+_ENV_SKIP_FIELDS = frozenset({"dag_context"})
+
 
 @dataclass(kw_only=True)
 class Context:
@@ -36,10 +39,20 @@ class Context:
         },
     )
 
+    dag_context: str = field(
+        default="",
+        metadata={
+            "description": "DAG conversation context injected per-request. "
+            "Built from JSONL-DAG-engine graph data. Not read from env vars."
+        },
+    )
+
     def __post_init__(self) -> None:
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):
             if not f.init:
+                continue
+            if f.name in _ENV_SKIP_FIELDS:
                 continue
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))

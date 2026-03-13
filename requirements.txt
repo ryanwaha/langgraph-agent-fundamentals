@@ -18,3 +18,6 @@ python-telegram-bot>=20.0
 
 # Utils
 python-dotenv>=1.0.1
+
+# DAG engine
+python-ulid>=3.0.0

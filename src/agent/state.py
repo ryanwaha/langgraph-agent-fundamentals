@@ -53,9 +53,8 @@ class State(InputState):
     It is set to 'True' when the step count reaches recursion_limit - 1.
     """
 
-    # Additional attributes can be added here as needed.
-    # Common examples include:
-    # retrieved_documents: List[Document] = field(default_factory=list)
-    # extracted_entities: Dict[str, Any] = field(default_factory=dict)
-    # discord_user_id: str = field(default="")
-    # discord_guild_id: str = field(default="")
+    summary: str = field(default="")
+    """One-sentence summary of the Q-A exchange, produced by the summarize node.
+
+    Used by the bot layer to persist as the node's ``sum`` field in the DAG.
+    """

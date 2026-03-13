@@ -16,10 +16,10 @@ langgraph dev --no-browser
 # Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
 
 # Start Discord bot
-python -m bot.discord_bot
+PYTHONPATH=src python -m bot.discord_bot
 
 # Start Telegram bot
-python -m bot.telegram_bot
+PYTHONPATH=src python -m bot.telegram_bot
 ```
 
 > **Windows encoding**: `.env` must use ASCII-only comments (no em dashes `—`). The `langgraph dev` dotenv parser uses the system codepage (cp950 on this machine).
@@ -42,9 +42,10 @@ The bot layers and the agent are fully decoupled — `graph.ainvoke()` can be ca
 
 | File | Role |
 |------|------|
-| `graph.py` | StateGraph with two nodes: `call_model` → `tools` loop |
-| `state.py` | `InputState` (messages only) and `State` (+ `is_last_step`) |
-| `context.py` | `Context` dataclass — model name, system prompt, max_search_results. `__post_init__` auto-reads env vars (`MODEL`, `MAX_SEARCH_RESULTS`). |
+| `graph.py` | StateGraph: `call_model` ↔ `tools` loop → `summarize` node |
+| `state.py` | `InputState` (messages only) and `State` (+ `is_last_step`, `summary`) |
+| `context.py` | `Context` dataclass — model, system prompt, max_search_results, dag_context. `__post_init__` auto-reads env vars (skips `dag_context`). |
+| `dag.py` | sys.path shim for `src/jsonl-dag-engine/` + `build_dag_context()` helper |
 | `tools.py` | `TOOLS` list + `@register_tool` decorator — add a new tool by decorating an async function |
 | `prompts.py` | `SYSTEM_PROMPT` template (supports `{system_time}`) |
 | `utils.py` | `load_chat_model("provider/model")` and `get_message_text()` |
@@ -71,7 +72,15 @@ Each Discord channel gets its own `thread_id = str(message.channel.id)`. Enablin
 
 ### Telegram chat isolation
 
-Each Telegram chat gets its own `thread_id = str(message.chat_id)`. Private chats use the user's chat ID; group chats use the group's chat ID. Enabling per-chat conversation memory requires the same checkpointer change in `graph.py`.
+Each Telegram chat gets its own `thread_id = str(message.chat_id)`. Forum topics use `f"{chat_id}_{message_thread_id}"`. Conversation history is persisted via the DAG engine (see below).
+
+### DAG conversation memory
+
+JSONL-DAG-engine (`src/jsonl-dag-engine/`, git submodule) provides append-only DAG-structured conversation persistence. One `.jsonl` file per thread under `jsonls/`.
+
+- `src/agent/dag.py` — import shim + `build_dag_context()`: renders prior conversation as XML injected into the system message
+- `bot/telegram_bot.py` — DAG lifecycle: load → build context → invoke → append node → write session
+- Bot commands: `/list [n]`, `/branch <prefix>`, `/switch <prefix>` (alias)
 
 ## Key dependencies
 
@@ -82,6 +91,7 @@ Each Telegram chat gets its own `thread_id = str(message.chat_id)`. Private chat
 | `langchain-tavily>=0.2.17` | Web search tool |
 | `discord.py>=2.7.1` | Discord gateway client |
 | `python-telegram-bot>=20.0` | Telegram async bot client |
+| `python-ulid>=3.0.0` | ULID generation for DAG node IDs |
 | `langgraph-cli[inmem]` | `langgraph dev` Studio server |
 
 Default model: `google_genai/gemini-2.5-flash-lite` (set via `MODEL` in `.env`).

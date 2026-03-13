@@ -44,3 +44,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# DAG conversation data
+jsonls/
