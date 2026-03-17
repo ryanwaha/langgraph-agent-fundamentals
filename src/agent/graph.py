@@ -6,7 +6,7 @@ Works with a chat model with tool calling support.
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Literal, cast
+from typing import Dict, Literal, cast
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -80,7 +80,7 @@ async def call_model(
     """Call the LLM powering the agent."""
     # Load DAG on first entry; reuse on ReAct re-entries (after tools)
     if state.dag_graph is None:
-        thread_id = config["configurable"]["thread_id"]
+        thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
         jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
         JSONL_DIR.mkdir(parents=True, exist_ok=True)
         if not jsonl_path.exists():
@@ -128,7 +128,8 @@ async def summarize(
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
     dag_graph = state.dag_graph
-    thread_id = config["configurable"]["thread_id"]
+    assert dag_graph is not None  # always set by call_model before summarize runs
+    thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
     jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
 
     # Extract tool calls with success/fail from ToolMessages
@@ -158,7 +159,7 @@ async def summarize(
         f"Answer: {final_answer}"
     )
     try:
-        result = await model.ainvoke([{"role": "user", "content": summary_prompt}])
+        result = cast(QASummary, await model.ainvoke([{"role": "user", "content": summary_prompt}]))
         summary_text = result.summary
     except Exception:
         summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
@@ -187,9 +188,9 @@ async def summarize(
 
 builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
-builder.add_node(call_model)
+builder.add_node(call_model)  # type: ignore[arg-type]
 builder.add_node("tools", ToolNode(TOOLS))
-builder.add_node(summarize)
+builder.add_node(summarize)  # type: ignore[arg-type]
 
 builder.add_edge("__start__", "call_model")
 

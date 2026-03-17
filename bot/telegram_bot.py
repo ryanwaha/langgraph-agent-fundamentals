@@ -90,7 +90,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     message = update.message
-    text = message.text
+    text: str = message.text  # type: ignore[assignment]  # guarded by None check above
 
     # In group/supergroup chats, only respond when @mentioned
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
