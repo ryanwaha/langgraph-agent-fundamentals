@@ -23,14 +23,7 @@ from telegram.ext import (
 )
 
 from agent.context import Context
-from agent.dag import (
-    append_node,
-    build_dag_context,
-    init_jsonl,
-    load,
-    switch_active,
-    write_session,
-)
+from agent.dag import load, switch_active, write_session
 from agent.graph import graph
 from agent.state import InputState
 from agent.utils import get_message_text
@@ -68,66 +61,18 @@ def _jsonl_path(thread_id: str) -> Path:
 
 
 async def run_agent(user_message: str, thread_id: str) -> str:
-    """Invoke the LangGraph agent with DAG context and persist the result.
+    """Invoke the LangGraph agent and return its answer.
 
-    Flow:
-    1. Load (or initialize) the JSONL file for this thread.
-    2. Build DAG context from the conversation graph.
-    3. Invoke the LangGraph agent with dag_context in Context.
-    4. Extract the answer and summary from the result.
-    5. Append a new node to the DAG.
-    6. Write a session record to persist active_node.
-
-    Args:
-        user_message: The raw text from the Telegram user.
-        thread_id: Unique identifier for this conversation thread.
-
-    Returns:
-        The agent's final text response.
+    DAG lifecycle (load → build context → append node → write session)
+    is handled inside the agent graph nodes.
     """
-    jsonl_path = _jsonl_path(thread_id)
-
-    # Load or initialize the DAG
-    if jsonl_path.exists():
-        dag_graph = load(jsonl_path)
-    else:
-        init_jsonl(jsonl_path, graph_id=thread_id)
-        dag_graph = load(jsonl_path)
-
-    # Build DAG context (empty string if no nodes yet)
-    dag_context = build_dag_context(dag_graph)
-
     config = RunnableConfig(configurable={"thread_id": thread_id})
-
     result = await graph.ainvoke(
         InputState(messages=[HumanMessage(content=user_message)]),
         config=config,
-        context=Context(dag_context=dag_context),
+        context=Context(),
     )
-
-    # Extract answer and summary
-    final_message = result["messages"][-1]
-    answer = get_message_text(final_message)
-    summary = result.get("summary", "")
-
-    # Determine parent node(s)
-    parents = [dag_graph.active_node] if dag_graph.active_node else []
-
-    # Append the new node to the DAG
-    new_node = append_node(
-        dag_graph,
-        jsonl_path,
-        q=user_message,
-        a=answer,
-        sum_text=summary,
-        parents=parents,
-    )
-
-    # Update active node and persist
-    dag_graph.active_node = new_node.id
-    write_session(dag_graph, jsonl_path)
-
-    return answer
+    return get_message_text(result["messages"][-1])
 
 
 # ---------------------------------------------------------------------------

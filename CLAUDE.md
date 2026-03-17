@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current Status (2026-03-17)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Telegram bot | ✅ Active | Full DAG integration; production path |
+| Discord bot | 🟡 Disabled | `DISCORD_BOT_TOKEN=null` in `.env`; no DAG integration |
+| LangGraph Studio | ✅ Ready | `langgraph dev` works |
+| jsonl-dag-engine | ✅ Populated | git submodule at `src/jsonl-dag-engine/`, commit `7f67b69` |
+| Checkpointer | 🟡 Not added | `graph.compile()` has no checkpointer; Discord thread memory is not persisted |
+
+**Known gaps**:
+- Discord bot lacks DAG conversation memory (Telegram is the only frontend with full history)
+- No LangGraph checkpointer — if needed, add to `graph.compile()` in `graph.py`
+- `plan_draft.md` at project root tracks ongoing design plans
+
 ## Environment
 
 - **Conda env**: `LG` — always use `conda activate LG` before running anything
@@ -95,3 +110,21 @@ JSONL-DAG-engine (`src/jsonl-dag-engine/`, git submodule) provides append-only D
 | `langgraph-cli[inmem]` | `langgraph dev` Studio server |
 
 Default model: `google_genai/gemini-2.5-flash-lite` (set via `MODEL` in `.env`).
+
+## DAG engine integration notes
+
+`src/agent/dag.py` is the bridge between the agent and jsonl-dag-engine:
+- Adds `src/jsonl-dag-engine/` to `sys.path` at import time
+- Re-exports all public DAG API (`load`, `append_node`, `write_session`, `switch_active`, `init_jsonl`, `generate_id`, `Graph`, `Node`, `PromptBuilder`)
+- `build_dag_context(dag_graph)` renders prior conversation as `<conversation>` + `<narrative>` XML (via `PromptBuilder`), returned as a string appended to the system message in `graph.py`
+
+**Telegram DAG lifecycle** (`bot/telegram_bot.py`):
+1. `load(jsonl_path)` — load existing JSONL or `init_jsonl()` for new thread
+2. `build_dag_context(dag_graph)` — render XML context from active node's ancestors
+3. `graph.ainvoke(context=Context(dag_context=...))` — inject into system message
+4. `append_node(q, a, sum_text, parents=[active_node])` — persist Q-A pair + summary
+5. `write_session(graph, path)` — persist updated `active_node`
+
+**JSONL storage**: `jsonls/{thread_id}.jsonl` — one file per Telegram chat (real data exists at `jsonls/7127827719.jsonl`)
+
+**Record types** in JSONL: `meta`, `node` (id/q/a/sum/parents), `session` (active_node snapshot), `tombstone` (soft delete)

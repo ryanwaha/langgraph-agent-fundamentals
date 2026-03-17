@@ -8,8 +8,7 @@ from typing import Annotated
 
 from . import prompts
 
-# Fields that are set programmatically per-request, not from env vars.
-_ENV_SKIP_FIELDS = frozenset({"dag_context"})
+_ENV_SKIP_FIELDS: frozenset[str] = frozenset()
 
 
 @dataclass(kw_only=True)
@@ -36,14 +35,6 @@ class Context:
         default=5,
         metadata={
             "description": "The maximum number of search results to return for each search query."
-        },
-    )
-
-    dag_context: str = field(
-        default="",
-        metadata={
-            "description": "DAG conversation context injected per-request. "
-            "Built from JSONL-DAG-engine graph data. Not read from env vars."
         },
     )
 

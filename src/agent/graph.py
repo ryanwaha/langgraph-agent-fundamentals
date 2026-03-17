@@ -3,19 +3,33 @@
 Works with a chat model with tool calling support.
 """
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Dict, List, Literal, cast
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 
 from agent.context import Context
+from agent.dag import (
+    append_node,
+    build_dag_context,
+    generate_id,
+    init_jsonl,
+    load,
+    write_session,
+)
 from agent.state import InputState, State
 from agent.tools import TOOLS
 from agent.utils import get_message_text, load_chat_model
+
+JSONL_DIR = Path("jsonls")
+LOG_DIR = Path("logs")
 
 
 # ---------------------------------------------------------------------------
@@ -32,33 +46,58 @@ class QASummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_tool_log(thread_id: str, node_id: str, tools: list[dict]) -> int:
+    """Append one tool-call log entry. Returns 1-based line number."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{thread_id}.jsonl"
+    if log_path.exists():
+        with open(log_path, encoding="utf-8") as f:
+            line_num = sum(1 for _ in f) + 1
+    else:
+        line_num = 1
+    entry = {
+        "node_id": node_id,
+        "ts": datetime.now(tz=UTC).isoformat(),
+        "tools": tools,
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return line_num
+
+
+# ---------------------------------------------------------------------------
 # Graph nodes
 # ---------------------------------------------------------------------------
 
 
 async def call_model(
-    state: State, runtime: Runtime[Context]
-) -> Dict[str, List[AIMessage]]:
-    """Call the LLM powering the agent.
+    state: State, runtime: Runtime[Context], config: RunnableConfig
+) -> dict:
+    """Call the LLM powering the agent."""
+    # Load DAG on first entry; reuse on ReAct re-entries (after tools)
+    if state.dag_graph is None:
+        thread_id = config["configurable"]["thread_id"]
+        jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
+        JSONL_DIR.mkdir(parents=True, exist_ok=True)
+        if not jsonl_path.exists():
+            init_jsonl(jsonl_path, graph_id=thread_id)
+        dag_graph = load(jsonl_path)
+    else:
+        dag_graph = state.dag_graph
 
-    This function prepares the prompt, initializes the model, and processes the response.
-
-    Args:
-        state: The current state of the conversation.
-        runtime: Runtime context containing model and configuration.
-
-    Returns:
-        A dictionary containing the model's response message.
-    """
     model = load_chat_model(runtime.context.model).bind_tools(TOOLS)
 
     system_message = runtime.context.system_prompt.format(
         system_time=datetime.now(tz=UTC).isoformat()
     )
 
-    # Append DAG conversation context if available
-    if runtime.context.dag_context:
-        system_message = system_message + "\n\n" + runtime.context.dag_context
+    dag_context = build_dag_context(dag_graph)
+    if dag_context:
+        system_message = system_message + "\n\n" + dag_context
 
     response = cast(
         AIMessage,
@@ -75,42 +114,71 @@ async def call_model(
                     id=response.id,
                     content="Sorry, I could not find an answer to your question in the specified number of steps.",
                 )
-            ]
+            ],
+            "dag_graph": dag_graph,
         }
 
-    return {"messages": [response]}
+    return {"messages": [response], "dag_graph": dag_graph}
 
 
 async def summarize(
-    state: State, runtime: Runtime[Context]
+    state: State, runtime: Runtime[Context], config: RunnableConfig
 ) -> Dict[str, str]:
-    """Generate a one-sentence summary of the completed Q-A exchange.
-
-    Called after the ReAct loop ends (no more tool calls).  Extracts the
-    user's question and the agent's final answer, then uses structured
-    output to produce a dense summary for DAG persistence.
-    """
+    """Summarize the Q-A exchange and persist to DAG."""
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
+    dag_graph = state.dag_graph
+    thread_id = config["configurable"]["thread_id"]
+    jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
 
+    # Extract tool calls with success/fail from ToolMessages
+    tool_msg_map: dict[str, ToolMessage] = {
+        m.tool_call_id: m
+        for m in state.messages
+        if isinstance(m, ToolMessage)
+    }
+    tools_used = []
+    for msg in state.messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tm = tool_msg_map.get(tc["id"])
+                ok = (getattr(tm, "status", "success") != "error") if tm else True
+                tools_used.append({"name": tc["name"], "input": tc["args"], "ok": ok})
+
+    # Pre-generate ULID so log entry and DAG node share the same ID
+    node_id = generate_id()
+    log_ref = _write_tool_log(thread_id, node_id, tools_used) if tools_used else None
+
+    # Generate summary
     model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
-
     summary_prompt = (
         "Summarize the following Q-A exchange in ONE concise sentence. "
         "Capture the key question and the essence of the answer.\n\n"
         f"Question: {user_query}\n\n"
         f"Answer: {final_answer}"
     )
-
     try:
-        result = await model.ainvoke(
-            [{"role": "user", "content": summary_prompt}]
-        )
-        return {"summary": result.summary}
+        result = await model.ainvoke([{"role": "user", "content": summary_prompt}])
+        summary_text = result.summary
     except Exception:
-        # Fallback: truncated user query as summary
-        fallback = user_query[:100] + ("..." if len(user_query) > 100 else "")
-        return {"summary": fallback}
+        summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
+
+    # Persist to DAG
+    parents = [dag_graph.active_node] if dag_graph.active_node else []
+    new_node = append_node(
+        dag_graph,
+        jsonl_path,
+        q=user_query,
+        a=final_answer,
+        sum_text=summary_text,
+        parents=parents,
+        node_id=node_id,
+        log_ref=log_ref,
+    )
+    dag_graph.active_node = new_node.id
+    write_session(dag_graph, jsonl_path)
+
+    return {"summary": summary_text}
 
 
 # ---------------------------------------------------------------------------
@@ -127,14 +195,6 @@ builder.add_edge("__start__", "call_model")
 
 
 def route_model_output(state: State) -> Literal["summarize", "tools"]:
-    """Determine the next node based on the model's output.
-
-    Args:
-        state: The current state of the conversation.
-
-    Returns:
-        The name of the next node to call ("summarize" or "tools").
-    """
     last_message = state.messages[-1]
     if not isinstance(last_message, AIMessage):
         raise ValueError(
