@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 from agent.context import Context
-from agent.dag import load, switch_active, write_session
+from agent.dag import delete_node, load, maintain, render_topology_svg, switch_active, write_session
 from agent.graph import graph
 from agent.state import InputState
 from agent.utils import get_message_text
@@ -53,6 +53,27 @@ def _thread_id(message) -> str:
 
 def _jsonl_path(thread_id: str) -> Path:
     return JSONL_DIR / f"{thread_id}.jsonl"
+
+
+def _resolve_node_id(dag_graph, prefix: str) -> str | None:
+    """Resolve a ULID prefix to a full node ID. Returns None and sets reply on ambiguity/miss."""
+    matches = [nid for nid in dag_graph.nodes if nid.lower().startswith(prefix.lower())]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) == 0:
+        return None
+    return None  # ambiguous — caller checks len(matches) separately
+
+
+def _match_node(dag_graph, prefix: str) -> tuple[str | None, str | None]:
+    """Return (node_id, error_message). Exactly one match → (id, None); else (None, msg)."""
+    matches = [nid for nid in dag_graph.nodes if nid.lower().startswith(prefix.lower())]
+    if len(matches) == 0:
+        return None, f"No node found matching '{prefix}'."
+    if len(matches) > 1:
+        sample = ", ".join(m[:8] for m in matches[:5])
+        return None, f"Ambiguous prefix. Matches: {sample}"
+    return matches[0], None
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +162,6 @@ async def cmd_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Usage: /branch <node_id_prefix>")
         return
 
-    target_prefix = args[0].lower()
     thread_id = _thread_id(update.message)
     jsonl_path = _jsonl_path(thread_id)
 
@@ -151,17 +171,10 @@ async def cmd_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     dag_graph = load(jsonl_path)
 
-    # Prefix-match node ID
-    matches = [nid for nid in dag_graph.nodes if nid.lower().startswith(target_prefix)]
-    if len(matches) == 0:
-        await update.message.reply_text(f"No node found matching '{target_prefix}'.")
+    target_id, err = _match_node(dag_graph, args[0])
+    if err:
+        await update.message.reply_text(err)
         return
-    if len(matches) > 1:
-        match_list = ", ".join(m[:8] for m in matches[:5])
-        await update.message.reply_text(f"Ambiguous prefix. Matches: {match_list}")
-        return
-
-    target_id = matches[0]
     try:
         switch_active(dag_graph, jsonl_path, target_id)
         write_session(dag_graph, jsonl_path)
@@ -226,6 +239,195 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(response)
 
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /status -- show thread info and active node."""
+    if update.message is None:
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    dag_graph = load(jsonl_path)
+    active = dag_graph.active_node[:8] if dag_graph.active_node else "None"
+    await update.message.reply_text(
+        f"thread: {thread_id}\nnodes: {len(dag_graph.nodes)}\nactive: {active}"
+    )
+
+
+async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /show -- show the active node's path to root."""
+    if update.message is None:
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    dag_graph = load(jsonl_path)
+
+    if dag_graph.active_node is None:
+        await update.message.reply_text("No active node.")
+        return
+
+    nodes = dag_graph.path_to_root(dag_graph.active_node)
+    if not nodes:
+        await update.message.reply_text("(active path is empty)")
+        return
+
+    lines: list[str] = []
+    for node in nodes:
+        lines.append(f"[{node.id[:8]}] Q: {node.q}")
+        if node.a:
+            lines.append(f"         A: {node.a[:120]}{'...' if len(node.a) > 120 else ''}")
+
+    response = "\n".join(lines)
+    if len(response) > 4096:
+        response = response[:4093] + "..."
+
+    await update.message.reply_text(response)
+
+
+async def cmd_paths(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /paths -- show all paths from active node to roots."""
+    if update.message is None:
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    dag_graph = load(jsonl_path)
+    paths = dag_graph.active_paths()
+
+    if not paths:
+        await update.message.reply_text("No active paths.")
+        return
+
+    lines: list[str] = []
+    for idx, path_nodes in enumerate(paths, start=1):
+        path_str = " -> ".join(n.id[:8] for n in path_nodes)
+        lines.append(f"path {idx}: {path_str}")
+
+    response = "\n".join(lines)
+    if len(response) > 4096:
+        response = response[:4093] + "..."
+
+    await update.message.reply_text(response)
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /delete -- soft-delete a node by ULID prefix.
+
+    Usage: /delete <node_id_prefix>
+    """
+    if update.message is None:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /delete <node_id_prefix>")
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    dag_graph = load(jsonl_path)
+
+    target_id, err = _match_node(dag_graph, args[0])
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    assert target_id is not None
+    node = dag_graph.nodes[target_id]
+    child_count = len(dag_graph.children.get(target_id, []))
+    warnings: list[str] = []
+    if len(node.parents) > 1:
+        warnings.append(f"[warn] {target_id[:8]} is a merge node ({len(node.parents)} parents).")
+    if child_count > 1:
+        warnings.append(f"[warn] {target_id[:8]} is a branch node ({child_count} children).")
+    elif child_count == 1:
+        warnings.append(f"[warn] {target_id[:8]} has a child node.")
+
+    try:
+        result = delete_node(dag_graph, jsonl_path, target_id)
+    except Exception as exc:
+        await update.message.reply_text(f"Error: {exc}")
+        return
+
+    if dag_graph.active_node == target_id:
+        dag_graph.active_node = node.parents[0] if node.parents else None
+    write_session(dag_graph, jsonl_path)
+
+    if result["already_deleted"]:
+        msg = f"{target_id[:8]} is already deleted."
+    else:
+        msg = f"Deleted: {target_id[:8]}"
+    if warnings:
+        msg = "\n".join(warnings) + "\n" + msg
+
+    await update.message.reply_text(msg)
+
+
+async def cmd_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /render -- render DAG topology to SVG and send as file."""
+    if update.message is None:
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    dag_graph = load(jsonl_path)
+
+    try:
+        output_path = render_topology_svg(dag_graph, jsonl_path)
+    except Exception as exc:
+        await update.message.reply_text(f"Render failed: {exc}")
+        return
+
+    with open(output_path, "rb") as f:
+        await update.message.reply_document(document=f, filename=output_path.name)
+
+
+async def cmd_maintain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /maintain -- compact, reorder, and rebuild the JSONL index."""
+    if update.message is None:
+        return
+
+    thread_id = _thread_id(update.message)
+    jsonl_path = _jsonl_path(thread_id)
+
+    if not jsonl_path.exists():
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    try:
+        maintain(jsonl_path)
+    except Exception as exc:
+        await update.message.reply_text(f"Maintain failed: {exc}")
+        return
+
+    await update.message.reply_text("Maintained: compact → reorder → rebuild_index")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -243,9 +445,15 @@ def main() -> None:
     app = ApplicationBuilder().token(token).build()
 
     # Command handlers (registered before the catch-all message handler)
-    app.add_handler(CommandHandler("branch", cmd_branch))
-    app.add_handler(CommandHandler("switch", cmd_switch))
-    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("branch",   cmd_branch))
+    app.add_handler(CommandHandler("switch",   cmd_switch))
+    app.add_handler(CommandHandler("list",     cmd_list))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("show",     cmd_show))
+    app.add_handler(CommandHandler("paths",    cmd_paths))
+    app.add_handler(CommandHandler("delete",   cmd_delete))
+    app.add_handler(CommandHandler("render",   cmd_render))
+    app.add_handler(CommandHandler("maintain", cmd_maintain))
 
     # Message handler (catch-all for non-command text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

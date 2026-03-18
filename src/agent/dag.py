@@ -24,6 +24,9 @@ from dag_engine import (  # noqa: E402
     switch_active,
     init_jsonl,
     generate_id,
+    delete_node,
+    render_topology_svg,
+    maintain,
 )
 from prompt_builder import PromptBuilder  # noqa: E402
 
@@ -36,6 +39,9 @@ __all__ = [
     "switch_active",
     "init_jsonl",
     "generate_id",
+    "delete_node",
+    "render_topology_svg",
+    "maintain",
     "PromptBuilder",
     "build_dag_context",
 ]
