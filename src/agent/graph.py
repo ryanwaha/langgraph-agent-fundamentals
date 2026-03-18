@@ -3,6 +3,7 @@
 Works with a chat model with tool calling support.
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,13 @@ from agent.utils import get_message_text, load_chat_model
 JSONL_DIR = Path("jsonls")
 LOG_DIR = Path("logs")
 
+# In-process cache: avoids re-loading DAG on every ReAct re-entry.
+# Key = thread_id, value = Graph instance.
+# Safe because a single invoke processes one thread at a time.
+from agent.dag import Graph as _Graph
+
+_dag_cache: dict[str, _Graph] = {}
+
 
 # ---------------------------------------------------------------------------
 # Structured output schema for the summarize node
@@ -50,23 +58,27 @@ class QASummary(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _write_tool_log(thread_id: str, node_id: str, tools: list[dict]) -> int:
+async def _write_tool_log(thread_id: str, node_id: str, tools: list[dict]) -> int:
     """Append one tool-call log entry. Returns 1-based line number."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{thread_id}.jsonl"
-    if log_path.exists():
-        with open(log_path, encoding="utf-8") as f:
-            line_num = sum(1 for _ in f) + 1
-    else:
-        line_num = 1
-    entry = {
-        "node_id": node_id,
-        "ts": datetime.now(tz=UTC).isoformat(),
-        "tools": tools,
-    }
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return line_num
+
+    def _sync_write() -> int:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if log_path.exists():
+            with open(log_path, encoding="utf-8") as f:
+                line_num = sum(1 for _ in f) + 1
+        else:
+            line_num = 1
+        entry = {
+            "node_id": node_id,
+            "ts": datetime.now(tz=UTC).isoformat(),
+            "tools": tools,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return line_num
+
+    return await asyncio.to_thread(_sync_write)
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +90,15 @@ async def call_model(
     state: State, runtime: Runtime[Context], config: RunnableConfig
 ) -> dict:
     """Call the LLM powering the agent."""
-    # Load DAG on first entry; reuse on ReAct re-entries (after tools)
-    if state.dag_graph is None:
-        thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
+    # Load DAG on first entry; reuse from cache on ReAct re-entries (after tools)
+    thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
+    if thread_id not in _dag_cache:
         jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
-        JSONL_DIR.mkdir(parents=True, exist_ok=True)
-        if not jsonl_path.exists():
-            init_jsonl(jsonl_path, graph_id=thread_id)
-        dag_graph = load(jsonl_path)
-    else:
-        dag_graph = state.dag_graph
+        await asyncio.to_thread(JSONL_DIR.mkdir, parents=True, exist_ok=True)
+        if not await asyncio.to_thread(jsonl_path.exists):
+            await asyncio.to_thread(init_jsonl, jsonl_path, graph_id=thread_id)
+        _dag_cache[thread_id] = await asyncio.to_thread(load, jsonl_path)
+    dag_graph = _dag_cache[thread_id]
 
     model = load_chat_model(runtime.context.model).bind_tools(TOOLS)
 
@@ -115,10 +126,9 @@ async def call_model(
                     content="Sorry, I could not find an answer to your question in the specified number of steps.",
                 )
             ],
-            "dag_graph": dag_graph,
         }
 
-    return {"messages": [response], "dag_graph": dag_graph}
+    return {"messages": [response]}
 
 
 async def summarize(
@@ -127,9 +137,8 @@ async def summarize(
     """Summarize the Q-A exchange and persist to DAG."""
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
-    dag_graph = state.dag_graph
-    assert dag_graph is not None  # always set by call_model before summarize runs
     thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
+    dag_graph = _dag_cache[thread_id]  # always populated by call_model
     jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
 
     # Extract tool calls with success/fail from ToolMessages
@@ -148,7 +157,7 @@ async def summarize(
 
     # Pre-generate ULID so log entry and DAG node share the same ID
     node_id = generate_id()
-    log_ref = _write_tool_log(thread_id, node_id, tools_used) if tools_used else None
+    log_ref = await _write_tool_log(thread_id, node_id, tools_used) if tools_used else None
 
     # Generate summary
     model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
@@ -166,7 +175,8 @@ async def summarize(
 
     # Persist to DAG
     parents = [dag_graph.active_node] if dag_graph.active_node else []
-    new_node = append_node(
+    new_node = await asyncio.to_thread(
+        append_node,
         dag_graph,
         jsonl_path,
         q=user_query,
@@ -177,7 +187,7 @@ async def summarize(
         log_ref=log_ref,
     )
     dag_graph.active_node = new_node.id
-    write_session(dag_graph, jsonl_path)
+    await asyncio.to_thread(write_session, dag_graph, jsonl_path)
 
     return {"summary": summary_text}
 

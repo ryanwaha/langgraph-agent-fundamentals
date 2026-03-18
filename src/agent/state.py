@@ -10,8 +10,6 @@ from langgraph.graph import add_messages
 from langgraph.managed import IsLastStep
 from typing_extensions import Annotated
 
-from agent.dag import Graph
-
 
 @dataclass
 class InputState:
@@ -57,6 +55,3 @@ class State(InputState):
 
     summary: str = field(default="")
     """One-sentence summary of the Q-A exchange, produced by the summarize node."""
-
-    dag_graph: Graph | None = field(default=None)
-    """DAG conversation graph, loaded on first entry to call_model and carried through the ReAct loop."""
