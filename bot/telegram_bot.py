@@ -10,16 +10,15 @@ import html
 import logging
 import os
 import re
-import time
 from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from markdown_it import MarkdownIt
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReactionTypeEmoji, Update
-from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -41,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 JSONL_DIR = Path("jsonls")
 
-# Minimum seconds between Telegram editMessage calls (flood limit ~1/sec per chat)
-_EDIT_INTERVAL = 1.2
+# markdown-it-py parser (CommonMark spec; used by _md_to_html)
+_MD = MarkdownIt("commonmark")
 
 # Per-thread asyncio Lock: prevents concurrent agent invocations on the same thread.
 # defaultdict(asyncio.Lock) creates a new Lock lazily for each thread_id.
@@ -65,36 +64,32 @@ def _h(text: str) -> str:
 
 
 def _md_to_html(text: str) -> str:
-    """Convert common LLM Markdown to Telegram HTML (parse_mode=HTML).
+    """Convert LLM Markdown to Telegram HTML using markdown-it-py (CommonMark).
 
-    Handles: fenced code blocks, inline code, bold, italic, headers,
-    strikethrough.  Non-code text is HTML-escaped first so that angle
-    brackets / ampersands in prose are always safe.
+    markdown-it-py handles nested formatting, links, lists, and fenced code
+    blocks correctly.  Output is post-processed to map standard HTML tags to
+    Telegram's whitelist: b, i, s, u, code, pre, a, tg-spoiler.
     """
-    result: list[str] = []
-    # Split on fenced code blocks (```...```) — captured so odd-indexed parts are code.
-    parts = re.split(r"(```[^\n]*\n[\s\S]*?```)", text)
-    for i, part in enumerate(parts):
-        if i % 2 == 1:
-            # Fenced code block — extract optional language tag and content.
-            m = re.match(r"```[^\n]*\n([\s\S]*?)```", part)
-            code = html.escape(m.group(1).rstrip()) if m else html.escape(part)
-            result.append(f"<pre><code>{code}</code></pre>")
-        else:
-            # Prose — escape HTML first, then apply inline markdown patterns.
-            s = html.escape(part)
-            # Inline code (content already escaped).
-            s = re.sub(r"`([^`\n]+)`", lambda m: f"<code>{m.group(1)}</code>", s)
-            # Bold (**...**)
-            s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s, flags=re.DOTALL)
-            # Italic (*...*)  — only single asterisk remaining after bold pass.
-            s = re.sub(r"\*([^*\n]+?)\*", r"<i>\1</i>", s)
-            # Strikethrough
-            s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s, flags=re.DOTALL)
-            # ATX headers (# / ## / ###…) → bold line
-            s = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", s, flags=re.MULTILINE)
-            result.append(s)
-    return "".join(result)
+    html_out = _MD.render(text)
+    # Map standard HTML → Telegram HTML whitelist
+    html_out = re.sub(r"<strong>(.*?)</strong>", r"<b>\1</b>", html_out, flags=re.DOTALL)
+    html_out = re.sub(r"<em>(.*?)</em>", r"<i>\1</i>", html_out, flags=re.DOTALL)
+    html_out = re.sub(r"<del>(.*?)</del>", r"<s>\1</s>", html_out, flags=re.DOTALL)
+    # Headings → bold + newline
+    html_out = re.sub(r"<h[1-6]>(.*?)</h[1-6]>", r"<b>\1</b>\n", html_out, flags=re.DOTALL)
+    # Paragraphs → text + newline (strip the wrapper)
+    html_out = re.sub(r"<p>(.*?)</p>", r"\1\n", html_out, flags=re.DOTALL)
+    # List items → bullet
+    html_out = re.sub(r"<li>(.*?)</li>", r"• \1\n", html_out, flags=re.DOTALL)
+    # Strip list/blockquote wrapper tags
+    html_out = re.sub(r"</?(?:ul|ol|blockquote)[^>]*>", "", html_out)
+    # Strip any remaining non-whitelisted tags
+    html_out = re.sub(
+        r"</?(?!(?:b|i|s|u|code|pre|a|tg-spoiler)(?:\s|>|/))[a-zA-Z][^>]*>", "", html_out
+    )
+    # ~~strikethrough~~ fallback (not in CommonMark preset, handled after render)
+    html_out = re.sub(r"~~(.+?)~~", r"<s>\1</s>", html_out, flags=re.DOTALL)
+    return html_out.strip()
 
 
 def _truncate(text: str, limit: int = 4096) -> str:
@@ -185,21 +180,22 @@ async def run_agent(user_message: str, thread_id: str) -> str:
 async def run_agent_streaming(
     user_message: str,
     thread_id: str,
-    status_msg: Message,
-) -> str:
-    """Stream agent execution, updating status_msg with live CoT progress.
+    bot: object,
+    chat_id: int,
+    message_thread_id: int | None,
+) -> Message:
+    """Stream agent execution via sendMessageDraft (forum topic mode).
 
-    Displays step-by-step progress (thinking → searching → answer) by
-    editing the status message as astream_events fires.  Returns the
-    final answer string.
+    Sends animated draft bubbles while the agent is running, then publishes
+    the final answer as a real message.  Returns the published Message so the
+    caller can attach an inline keyboard.
     """
     config = RunnableConfig(configurable={"thread_id": thread_id})
 
     header = f"💬 <b>用戶說：</b>{_h(user_message[:100])}"
-    steps: list[str] = []          # one entry per tool call (⏳ → ✅)
+    steps: list[str] = []
     current_query: str | None = None
     answer_buf = ""
-    last_edit = 0.0
 
     def _build(extra: str = "", spoiler_steps: bool = False) -> str:
         parts = [header]
@@ -210,16 +206,15 @@ async def run_agent_streaming(
             parts.append(extra)
         return _truncate("\n\n".join(parts))
 
-    async def _edit(text: str, force: bool = False) -> None:
-        nonlocal last_edit
-        now = time.monotonic()
-        if not force and now - last_edit < _EDIT_INTERVAL:
-            return
+    async def _draft(text: str) -> None:
         try:
-            await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
-            last_edit = now
-        except BadRequest:
-            pass  # "message is not modified" — safe to ignore
+            await bot.send_message_draft(  # type: ignore[attr-defined]
+                chat_id,
+                draft_id=1,
+                text=text,
+                message_thread_id=message_thread_id,
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
 
@@ -234,7 +229,7 @@ async def run_agent_streaming(
 
         if evt == "on_chat_model_start" and node == "call_model":
             answer_buf = ""
-            await _edit(_build("🤔 正在思考..."))
+            await _draft(_build("🤔 正在思考..."))
 
         elif evt == "on_tool_start":
             tool_name: str = event["name"]
@@ -246,12 +241,11 @@ async def run_agent_streaming(
             else:
                 current_query = None
                 steps.append(f"⏳ 正在執行：{_h(label)}")
-            await _edit(_build())
+            await _draft(_build())
 
         elif evt == "on_tool_end":
             tool_name = event["name"]
             label = _TOOL_LABELS.get(tool_name, tool_name)
-            # Replace the last ⏳ line for this tool with ✅
             for i in range(len(steps) - 1, -1, -1):
                 if steps[i].startswith("⏳"):
                     if tool_name == "search" and current_query:
@@ -260,7 +254,7 @@ async def run_agent_streaming(
                         steps[i] = steps[i].replace("⏳ 正在", "✅ 已完成", 1)
                     break
             current_query = None
-            await _edit(_build())
+            await _draft(_build())
 
         elif evt == "on_chat_model_stream" and node == "call_model":
             chunk = event["data"].get("chunk")
@@ -268,19 +262,24 @@ async def run_agent_streaming(
                 token = get_message_text(chunk)
                 if token:
                     answer_buf += token
-                    await _edit(_build(_md_to_html(answer_buf)))
+                    await _draft(_build(_md_to_html(answer_buf)))
 
         # Ignore all events from the "summarize" node (DAG summarization LLM call)
 
     final_answer = answer_buf.strip()
-    # Final unconditional edit: answer in MD→HTML, CoT steps collapsed into spoiler.
     final_text = (
         _build(_md_to_html(final_answer), spoiler_steps=True)
         if final_answer
         else _build("(無回應)", spoiler_steps=True)
     )
-    await _edit(final_text, force=True)
-    return final_answer
+    # Publish the final answer as a real message (replaces the draft bubble)
+    final_msg: Message = await bot.send_message(  # type: ignore[attr-defined]
+        chat_id,
+        text=final_text,
+        message_thread_id=message_thread_id,
+        parse_mode=ParseMode.HTML,
+    )
+    return final_msg
 
 
 # ---------------------------------------------------------------------------
@@ -337,16 +336,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass
 
-        # Send initial placeholder message that will be progressively edited
-        init_text = f"💬 <b>用戶說：</b>{_h(user_text[:100])}\n\n🤔 正在思考..."
-        status_msg = await message.reply_text(init_text, parse_mode=ParseMode.HTML)
-
         async with _thread_locks[thread_id]:
             try:
-                await run_agent_streaming(user_text, thread_id, status_msg)
+                final_msg = await run_agent_streaming(
+                    user_text,
+                    thread_id,
+                    context.bot,
+                    message.chat_id,
+                    message.message_thread_id,
+                )
             except Exception as exc:
                 logger.exception("Agent invocation failed for thread %s", thread_id)
-                await status_msg.edit_text(f"Sorry, I encountered an error: {exc}")
+                await message.reply_text(f"Sorry, I encountered an error: {exc}")
                 return
 
         # Attach inline keyboard (Regenerate / Branch here)
@@ -354,7 +355,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         node_id = dag.active_node if dag else None
         kb = _make_reply_keyboard(thread_id, user_text, node_id)
         try:
-            await status_msg.edit_reply_markup(reply_markup=kb)
+            await final_msg.edit_reply_markup(reply_markup=kb)
         except Exception:
             pass
 
@@ -388,22 +389,31 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_message: str = data.get("q", "")
         if not user_message or not thread_id:
             return
-        await query.edit_message_text(
-            f"💬 <b>用戶說：</b>{_h(user_message[:100])}\n\n🔄 正在重新思考...",
-            parse_mode=ParseMode.HTML,
-        )
-        status_msg = query.message
+        old_msg = query.message
+        chat_id_regen: int = old_msg.chat_id
+        thread_id_regen: int | None = old_msg.message_thread_id
+        # Delete the old answer; new answer comes from run_agent_streaming
+        try:
+            await old_msg.delete()
+        except Exception:
+            pass
         async with _thread_locks[thread_id]:
             try:
-                await run_agent_streaming(user_message, thread_id, status_msg)
+                final_msg = await run_agent_streaming(
+                    user_message,
+                    thread_id,
+                    context.bot,
+                    chat_id_regen,
+                    thread_id_regen,
+                )
             except Exception as exc:
-                await status_msg.edit_text(f"Error: {exc}")
+                await context.bot.send_message(chat_id_regen, text=f"Error: {exc}", message_thread_id=thread_id_regen)
                 return
         dag = _dag_cache.get(thread_id)
         node_id = dag.active_node if dag else None
         kb = _make_reply_keyboard(thread_id, user_message, node_id)
         try:
-            await status_msg.edit_reply_markup(reply_markup=kb)
+            await final_msg.edit_reply_markup(reply_markup=kb)
         except Exception:
             pass
 
