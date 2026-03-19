@@ -20,6 +20,7 @@ from agent.context import Context
 from agent.dag import (
     append_node,
     build_dag_context,
+    build_merge_context,
     generate_id,
     init_jsonl,
     load,
@@ -106,7 +107,11 @@ async def call_model(
         system_time=datetime.now(tz=UTC).isoformat()
     )
 
-    dag_context = build_dag_context(dag_graph)
+    merge_parents = getattr(dag_graph, "_merge_parents", None)
+    if merge_parents:
+        dag_context = build_merge_context(dag_graph, merge_parents)
+    else:
+        dag_context = build_dag_context(dag_graph)
     if dag_context:
         system_message = system_message + "\n\n" + dag_context
 
@@ -173,8 +178,13 @@ async def summarize(
     except Exception:
         summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
 
-    # Persist to DAG
-    parents = [dag_graph.active_node] if dag_graph.active_node else []
+    # Persist to DAG — use merge parents if set, then consume
+    merge_parents = getattr(dag_graph, "_merge_parents", None)
+    if merge_parents:
+        parents = merge_parents
+        del dag_graph._merge_parents  # type: ignore[attr-defined]
+    else:
+        parents = [dag_graph.active_node] if dag_graph.active_node else []
     new_node = await asyncio.to_thread(
         append_node,
         dag_graph,

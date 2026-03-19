@@ -44,6 +44,7 @@ __all__ = [
     "maintain",
     "PromptBuilder",
     "build_dag_context",
+    "build_merge_context",
 ]
 
 
@@ -71,5 +72,35 @@ def build_dag_context(dag_graph: Graph) -> str:
 
     sections: list[str] = []
     sections.append(builder._render_conversation(nodes, graph=dag_graph))
+    sections.append(builder._render_time_flow(dag_graph))
+    return "\n\n".join(sections)
+
+
+def build_merge_context(dag_graph: Graph, parent_ids: list[str]) -> str:
+    """Build context from multiple parent branches for a merge node.
+
+    Collects deduplicated ancestors from all parents and renders them
+    as conversation + narrative context.
+    """
+    merged: list[Node] = []
+    seen: set[str] = set()
+    for pid in parent_ids:
+        ancestors = dag_graph.flattened_ancestors(pid, include_self=True)
+        for node in ancestors:
+            if node.id not in seen:
+                merged.append(node)
+                seen.add(node.id)
+
+    if not merged:
+        return ""
+
+    builder = PromptBuilder(
+        include_summary=False,
+        include_time_flow=True,
+        prompt_dump_path=None,
+    )
+
+    sections: list[str] = []
+    sections.append(builder._render_conversation(merged, graph=dag_graph))
     sections.append(builder._render_time_flow(dag_graph))
     return "\n\n".join(sections)
