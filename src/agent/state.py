@@ -55,3 +55,6 @@ class State(InputState):
 
     summary: str = field(default="")
     """One-sentence summary of the Q-A exchange, produced by the summarize node."""
+
+    last_node_id: str | None = field(default=None)
+    """ULID of the DAG node created by the summarize node for this Q-A turn."""

@@ -5,6 +5,7 @@ Works with a chat model with tool calling support.
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Dict, Literal, cast
@@ -29,6 +30,8 @@ from agent.dag import (
 from agent.state import InputState, State
 from agent.tools import TOOLS
 from agent.utils import get_message_text, load_chat_model
+
+logger = logging.getLogger(__name__)
 
 JSONL_DIR = Path("jsonls")
 LOG_DIR = Path("logs")
@@ -176,6 +179,11 @@ async def summarize(
         result = cast(QASummary, await model.ainvoke([{"role": "user", "content": summary_prompt}]))
         summary_text = result.summary
     except Exception:
+        logger.warning(
+            "summarize: LLM call failed for thread %s, falling back to truncated query",
+            thread_id,
+            exc_info=True,
+        )
         summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
 
     # Persist to DAG — use merge parents if set, then consume
@@ -198,8 +206,9 @@ async def summarize(
     )
     dag_graph.active_node = new_node.id
     await asyncio.to_thread(write_session, dag_graph, jsonl_path)
+    _dag_cache.pop(thread_id, None)
 
-    return {"summary": summary_text}
+    return {"summary": summary_text, "last_node_id": node_id}
 
 
 # ---------------------------------------------------------------------------

@@ -481,8 +481,6 @@ async def run_agent_streaming(
                     answer_buf += token
                     await _draft(_build(_md_to_html(answer_buf)))
 
-        # Ignore all events from the "summarize" node (DAG summarization LLM call)
-
     final_answer = answer_buf.strip()
     final_text = (
         _build(_md_to_html(final_answer), spoiler_steps=True)
@@ -560,6 +558,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if dag:
                 dag._merge_parents = pending_merge  # type: ignore[attr-defined]
 
+        node_id: str | None = None
         async with _thread_locks[thread_id]:
             try:
                 final_msg = await run_agent_streaming(
@@ -575,8 +574,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
 
         # Attach inline keyboard (Regenerate / Branch here)
-        dag = _dag_cache.get(thread_id)
-        node_id = dag.active_node if dag else None
         kb = _make_reply_keyboard(thread_id, user_text, node_id)
         try:
             await final_msg.edit_reply_markup(reply_markup=kb)
@@ -633,8 +630,6 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except Exception as exc:
                 await context.bot.send_message(chat_id_regen, text=f"Error: {exc}", message_thread_id=thread_id_regen)
                 return
-        dag = _dag_cache.get(thread_id)
-        node_id = dag.active_node if dag else None
         kb = _make_reply_keyboard(thread_id, user_message, node_id)
         try:
             await final_msg.edit_reply_markup(reply_markup=kb)
