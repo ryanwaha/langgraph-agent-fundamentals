@@ -7,6 +7,7 @@ file, enabling branching conversation history.
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -152,6 +153,37 @@ def _table_to_pre(html_table: str) -> str:
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
+def _extract_block_math(text: str) -> tuple[str, list[str]]:
+    """Strip $$...$$ display math from text and return (cleaned_text, [formulas])."""
+    formulas: list[str] = []
+
+    def _collect(m: re.Match) -> str:
+        formulas.append(m.group(1).strip())
+        return ""
+
+    cleaned = re.sub(r"\$\$(.*?)\$\$", _collect, text, flags=re.DOTALL)
+    return cleaned.strip(), formulas
+
+
+def _render_formula_png(formula: str) -> io.BytesIO:
+    """Render a LaTeX display-math formula to a PNG image using matplotlib.mathtext."""
+    import matplotlib  # lazy import — only needed when formulas are present
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(8, 1.5))
+    fig.patch.set_facecolor("white")
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    ax.text(0.5, 0.5, f"${formula}$", size=18, ha="center", va="center",
+            transform=ax.transAxes)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150, pad_inches=0.3)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def _md_to_html(text: str) -> str:
     """Convert LLM Markdown to Telegram HTML using markdown-it-py (CommonMark).
 
@@ -159,17 +191,77 @@ def _md_to_html(text: str) -> str:
     blocks correctly.  Output is post-processed to map standard HTML tags to
     Telegram's whitelist: b, i, s, u, code, pre, a, tg-spoiler.
     """
-    # Insert ZWS between CJK full-width punctuation and a closing ** delimiter.
-    # CommonMark right-flanking rule: if preceded by Unicode punctuation, the
-    # closing ** must be followed by whitespace or punctuation.  When bold ends
-    # with a CJK bracket (e.g. **text（content）**的說明), the closing ** is
-    # preceded by ） (punct) and followed by 的 (CJK letter, non-punct) →
-    # right-flanking check fails → rendered literally.  ZWS (U+200B, category
-    # Cf) inserted before the ** makes the delimiter "preceded by non-punct"
-    # so right-flanking succeeds, without breaking any surrounding text.
-    _CJK_PUNCT = r"[（）「」【】〔〕『』，。！？：；、﹐﹑﹒﹔﹕]"
+    # --- LaTeX handling ---
+    # $$...$$ must be stashed BEFORE markdown rendering and BEFORE inline $...$
+    # conversion, because:
+    #   1. markdown-it-py would escape any injected HTML tags.
+    #   2. The inline regex \$([^$]+)\$ can accidentally match the inner part of
+    #      $$formula$$.
+    # Strategy: replace each $$...$$ with a unique control-char token (\x02Fn\x02)
+    # that markdown-it-py passes through verbatim; restore as <code> after rendering.
+    # Final calls arrive with no $$...$$ (already extracted for image sending), so
+    # this loop is a no-op for them.
+    _math_stash: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        _math_stash.append(f"<code>{_h(m.group(1).strip())}</code>")
+        return f"\x02F{len(_math_stash) - 1}\x02"
+
+    text = re.sub(r"\$\$(.*?)\$\$", _stash, text, flags=re.DOTALL)
+
+    # Convert remaining inline $...$ to Unicode via unicodeit.
+    import unicodeit  # lazy import
+
+    # Aliases and wrappers that unicodeit doesn't know.
+    _LATEX_PRE = [
+        (re.compile(r"\\dots\b"),                    r"\\ldots"),       # \dots → \ldots (unicodeit knows \ldots → …)
+        (re.compile(r"\\math(?:rm|bf|it|cal)\{([^}]*)\}"), r"\1"),      # \mathrm{x} → x
+        (re.compile(r"\\text\{([^}]*)\}"),           r"\1"),            # \text{foo} → foo
+        (re.compile(r"\\operatorname\{([^}]*)\}"),   r"\1"),            # \operatorname{sin} → sin
+    ]
+
+    def _pre_process(expr: str) -> str:
+        for pat, repl in _LATEX_PRE:
+            expr = pat.sub(repl, expr)
+        return expr
+
+    def _stash_inline(m: re.Match) -> str:
+        raw = m.group(1)
+        converted = unicodeit.replace(_pre_process(raw))
+        # Strip leftover LaTeX grouping braces (e.g. √{ρ} → √ρ)
+        converted = converted.replace("{", "").replace("}", "")
+        # Fall back to <code> only if unknown commands (\...) remain
+        if "\\" in converted:
+            repl = f"<code>{_h(raw)}</code>"
+        else:
+            repl = f"<b><i>{_h(converted)}</i></b>"
+        _math_stash.append(repl)
+        return f"\x02F{len(_math_stash) - 1}\x02"
+
+    text = re.sub(r"\$([^$\n]+)\$", _stash_inline, text)
+
+    # Fix CommonMark flanking delimiter failures caused by CJK full-width punctuation.
+    #
+    # Two failure modes, both fixed by inserting ZWS (U+200B, category Cf — neither
+    # Unicode whitespace Zs nor Unicode punctuation P*) adjacent to the delimiter:
+    #
+    # 1. CLOSING delimiter preceded by CJK punct, e.g. **text（content）**的說明
+    #    Right-flanking rule: if preceded by punct, must be followed by whitespace or
+    #    punct.  「的」 is neither → fails.  ZWS inserted BEFORE ** makes the delimiter
+    #    "preceded by non-punct" → right-flanking succeeds unconditionally.
+    #    Pattern: CJK_PUNCT → * (any CJK closing/neutral punct before a delimiter)
+    #
+    # 2. OPENING delimiter followed by CJK open bracket, e.g. 屬於**「統計...」**
+    #    Left-flanking rule: if followed by punct, must be preceded by whitespace or
+    #    punct.  「於」 is neither → fails.  ZWS inserted AFTER ** makes the delimiter
+    #    "followed by non-punct" → left-flanking succeeds unconditionally.
+    #    Pattern: * → CJK_OPEN_PUNCT (only opening brackets, NOT 。！？etc. to avoid
+    #    breaking cases like **99.98%**。 where ZWS after closing ** invalidates it)
+    _CJK_PUNCT      = r"[（）「」【】〔〕『』，。！？：；、﹐﹑﹒﹔﹕]"
+    _CJK_OPEN_PUNCT = r"[（「【〔『]"
     _ZWS = "\u200b"
-    text = re.sub(rf"({_CJK_PUNCT})([*_~`])", rf"\1{_ZWS}\2", text)
+    text = re.sub(rf"({_CJK_PUNCT})([*_~`])",      rf"\1{_ZWS}\2", text)  # rule 1
+    text = re.sub(rf"([*_~`])({_CJK_OPEN_PUNCT})", rf"\1{_ZWS}\2", text)  # rule 2
 
     html_out = _MD.render(text)
     # Map standard HTML → Telegram HTML whitelist
@@ -192,6 +284,9 @@ def _md_to_html(text: str) -> str:
     )
     # ~~strikethrough~~ fallback (not in CommonMark preset, handled after render)
     html_out = re.sub(r"~~(.+?)~~", r"<s>\1</s>", html_out, flags=re.DOTALL)
+    # Restore stashed $$...$$ tokens as <code> blocks.
+    for i, repl in enumerate(_math_stash):
+        html_out = html_out.replace(f"\x02F{i}\x02", repl)
     return html_out.strip()
 
 
@@ -518,13 +613,15 @@ async def run_agent_streaming(
     steps: list[str] = []
     current_query: str | None = None
     answer_buf = ""
+    thinking_buf = ""
+    thinking_step_idx: int = -1
     last_node_id: str | None = None
 
-    def _build(extra: str = "", spoiler_steps: bool = False) -> str:
+    def _build(extra: str = "") -> str:
         parts = [header]
         if steps:
             steps_block = "\n".join(steps)
-            parts.append(f"<tg-spoiler>{steps_block}</tg-spoiler>" if spoiler_steps else steps_block)
+            parts.append(f"<blockquote expandable>{steps_block}</blockquote>")
         if extra:
             parts.append(extra)
         return _truncate("\n\n".join(parts))
@@ -552,6 +649,8 @@ async def run_agent_streaming(
 
         if evt == "on_chat_model_start" and node == "call_model":
             answer_buf = ""
+            thinking_buf = ""
+            thinking_step_idx = -1
             await _draft(_build("🤔 正在思考..."))
 
         elif evt == "on_tool_start":
@@ -582,10 +681,28 @@ async def run_agent_streaming(
         elif evt == "on_chat_model_stream" and node == "call_model":
             chunk = event["data"].get("chunk")
             if chunk is not None:
-                token = get_message_text(chunk)
-                if token:
-                    answer_buf += token
-                    await _draft(_build(_md_to_html(answer_buf)))
+                content = chunk.content
+                blocks = content if isinstance(content, list) else ([{"type": "text", "text": content}] if content else [])
+                for block in blocks:
+                    btype = block.get("type", "text") if isinstance(block, dict) else "text"
+                    btext = (block.get("thinking", "") if btype == "thinking" else block.get("text", "")) if isinstance(block, dict) else str(block)
+                    if not btext:
+                        continue
+                    if btype == "thinking":
+                        if not thinking_buf:
+                            steps.append("🧠 正在推理...")
+                            thinking_step_idx = len(steps) - 1
+                        thinking_buf += btext
+                        steps[thinking_step_idx] = f"🧠 正在推理（{len(thinking_buf)} 字）..."
+                        await _draft(_build())
+                    else:
+                        if thinking_step_idx >= 0:
+                            preview = _h(thinking_buf[:300])
+                            suffix = "..." if len(thinking_buf) > 300 else ""
+                            steps[thinking_step_idx] = f"🧠 {preview}{suffix}"
+                            thinking_step_idx = -1
+                        answer_buf += btext
+                        await _draft(_build(_md_to_html(answer_buf)))
 
         elif evt == "on_chain_end" and node == "":
             # Top-level graph completion: capture last_node_id from output state
@@ -628,10 +745,11 @@ async def run_agent_streaming(
         return None, None
 
     final_answer = answer_buf.strip()
+    _, block_formulas = _extract_block_math(final_answer)
     final_text = (
-        _build(_md_to_html(final_answer), spoiler_steps=True)
+        _build(_md_to_html(final_answer))
         if final_answer
-        else _build("(無回應)", spoiler_steps=True)
+        else _build("(無回應)")
     )
     final_msg: Message = await bot.send_message(  # type: ignore[attr-defined]
         chat_id,
@@ -639,6 +757,16 @@ async def run_agent_streaming(
         message_thread_id=message_thread_id,
         parse_mode=ParseMode.HTML,
     )
+    for formula in block_formulas:
+        try:
+            buf = _render_formula_png(formula)
+            await bot.send_photo(  # type: ignore[attr-defined]
+                chat_id,
+                photo=buf,
+                message_thread_id=message_thread_id,
+            )
+        except Exception:
+            logger.exception("Failed to render formula: %s", formula[:80])
     return final_msg, last_node_id
 
 

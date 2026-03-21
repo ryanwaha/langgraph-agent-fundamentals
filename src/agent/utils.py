@@ -6,14 +6,18 @@ from langchain_core.messages import BaseMessage
 
 
 def get_message_text(msg: BaseMessage) -> str:
-    """Get the text content of a message."""
+    """Get the text content of a message, excluding thinking blocks."""
     content = msg.content
     if isinstance(content, str):
         return content
     elif isinstance(content, dict):
         return content.get("text", "")
     else:
-        txts = [c if isinstance(c, str) else (c.get("text") or "") for c in content]
+        txts = [
+            c if isinstance(c, str) else (c.get("text") or "")
+            for c in content
+            if not (isinstance(c, dict) and c.get("type") == "thinking")
+        ]
         return "".join(txts).strip()
 
 
@@ -24,4 +28,4 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
         fully_specified_name: String in the format 'provider/model'.
     """
     provider, model = fully_specified_name.split("/", maxsplit=1)
-    return init_chat_model(model, model_provider=provider)
+    return init_chat_model(model, model_provider=provider, include_thoughts=True, thinking_budget=2048)
