@@ -48,6 +48,11 @@ _dag_cache: dict[str, _Graph] = {}
 # Key = invoke_id (LangGraph thread_id / ULID), set on first call_model entry.
 _turn_start: dict[str, datetime] = {}
 
+# Session lifecycle: last activity timestamp per dag_thread_id.
+# A session is flushed (write_session + evict cache) after SESSION_TIMEOUT_S of inactivity.
+_last_activity: dict[str, datetime] = {}
+SESSION_TIMEOUT_S = 600  # 10 minutes
+
 
 # ---------------------------------------------------------------------------
 # Structured output schema for the summarize node
@@ -75,7 +80,6 @@ async def _write_turn_log(
     ts_end: datetime,
     model: str,
     q: str,
-    a: str,
     summary: str,
     steps: list[dict],
 ) -> int:
@@ -96,7 +100,6 @@ async def _write_turn_log(
             "duration_s": round((ts_end - ts_start).total_seconds(), 2),
             "model": model,
             "q": q,
-            "a": a,
             "summary": summary,
             "steps": steps,
         }
@@ -244,7 +247,6 @@ async def summarize(
         ts_end=ts_end,
         model=runtime.context.model,
         q=user_query,
-        a=final_answer,
         summary=summary_text,
         steps=steps,
     )
@@ -268,10 +270,52 @@ async def summarize(
         log_ref=log_ref,
     )
     dag_graph.active_node = new_node.id
-    await asyncio.to_thread(write_session, dag_graph, jsonl_path)
-    _dag_cache.pop(dag_thread_id, None)
+    _last_activity[dag_thread_id] = datetime.now(tz=UTC)
 
     return {"summary": summary_text, "last_node_id": node_id}
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle helpers
+# ---------------------------------------------------------------------------
+
+
+async def flush_session(dag_thread_id: str) -> bool:
+    """Write session record and evict cache for one thread. Returns True if flushed."""
+    dag_graph = _dag_cache.get(dag_thread_id)
+    if dag_graph is None:
+        return False
+    jsonl_path = JSONL_DIR / f"{dag_thread_id}.jsonl"
+    await asyncio.to_thread(write_session, dag_graph, jsonl_path)
+    _dag_cache.pop(dag_thread_id, None)
+    _last_activity.pop(dag_thread_id, None)
+    logger.info("Session flushed: thread=%s", dag_thread_id)
+    return True
+
+
+async def flush_all_sessions() -> None:
+    """Flush all open sessions (call on shutdown)."""
+    for tid in list(_dag_cache):
+        await flush_session(tid)
+
+
+async def _session_watchdog() -> None:
+    """Background task: flush sessions idle for SESSION_TIMEOUT_S seconds."""
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(tz=UTC)
+        expired = [
+            tid for tid, last in list(_last_activity.items())
+            if (now - last).total_seconds() >= SESSION_TIMEOUT_S
+        ]
+        for tid in expired:
+            await flush_session(tid)
+            logger.info("Session timed out: thread=%s", tid)
+
+
+def start_session_flusher() -> None:
+    """Schedule the session watchdog. Call once after the event loop is running."""
+    asyncio.get_event_loop().create_task(_session_watchdog())
 
 
 # ---------------------------------------------------------------------------

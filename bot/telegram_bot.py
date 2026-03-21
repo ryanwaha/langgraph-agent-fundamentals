@@ -32,8 +32,8 @@ from langgraph.types import Command
 
 from agent.context import Context
 from agent.logging_config import setup_logging
-from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_svg, switch_active, write_session
-from agent.graph import graph
+from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_png, switch_active, write_session
+from agent.graph import flush_all_sessions, flush_session, graph, start_session_flusher
 from agent.state import InputState
 from agent.utils import get_message_text
 
@@ -1208,7 +1208,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /render -- render DAG topology to SVG and send as file."""
+    """Handle /render -- render DAG topology to PNG and send as photo."""
     if update.message is None:
         return
 
@@ -1222,13 +1222,25 @@ async def cmd_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     dag_graph = load(jsonl_path)
 
     try:
-        output_path = render_topology_svg(dag_graph, jsonl_path)
+        output_path = render_topology_png(dag_graph, jsonl_path)
     except Exception as exc:
         await update.message.reply_text(f"Render failed: {exc}")
         return
 
     with open(output_path, "rb") as f:
-        await update.message.reply_document(document=f, filename=output_path.name)
+        await update.message.reply_photo(photo=f)
+
+
+async def cmd_end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /end_session -- manually flush session record to disk."""
+    if update.message is None:
+        return
+    dag_thread_id = _thread_id(update.message)
+    flushed = await flush_session(dag_thread_id)
+    if flushed:
+        await update.message.reply_text("✅ Session 已結束並寫入磁碟")
+    else:
+        await update.message.reply_text("無開放中的 session")
 
 
 async def cmd_maintain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1258,22 +1270,30 @@ async def cmd_maintain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _post_init(app) -> None:  # type: ignore[type-arg]
-    """Register bot commands so Telegram shows the / menu."""
+    """Register bot commands and start background tasks."""
     await app.bot.set_my_commands([
-        BotCommand("branch",   "切換到指定節點（開始新分支）"),
-        BotCommand("switch",   "/branch 別名"),
-        BotCommand("list",     "列出最近的對話節點"),
-        BotCommand("status",   "顯示目前會話狀態"),
-        BotCommand("show",     "顯示當前節點到根的路徑"),
-        BotCommand("paths",    "顯示所有分支路徑"),
-        BotCommand("view",     "互動式節點瀏覽器"),
-        BotCommand("merge",    "合併分支（選定父節點後發送問句）"),
-        BotCommand("delete",   "軟刪除指定節點"),
-        BotCommand("render",   "渲染 DAG 拓撲 SVG"),
-        BotCommand("maintain", "整理 JSONL 索引"),
+        BotCommand("branch",      "切換到指定節點（開始新分支）"),
+        BotCommand("switch",      "/branch 別名"),
+        BotCommand("list",        "列出最近的對話節點"),
+        BotCommand("status",      "顯示目前會話狀態"),
+        BotCommand("show",        "顯示當前節點到根的路徑"),
+        BotCommand("paths",       "顯示所有分支路徑"),
+        BotCommand("view",        "互動式節點瀏覽器"),
+        BotCommand("merge",       "合併分支（選定父節點後發送問句）"),
+        BotCommand("delete",      "軟刪除指定節點"),
+        BotCommand("render",      "渲染 DAG 拓撲圖"),
+        BotCommand("end_session", "立即結束並寫入當前 session"),
+        BotCommand("maintain",    "整理 JSONL 索引"),
     ])
+    start_session_flusher()
     me = await app.bot.get_me()
     print(f"Bot started: @{me.username}  |  logs → logs/bot.log")
+
+
+async def _post_shutdown(app) -> None:  # type: ignore[type-arg]
+    """Flush all open sessions on graceful shutdown."""
+    await flush_all_sessions()
+    logger.info("All sessions flushed on shutdown")
 
 
 def main() -> None:
@@ -1291,6 +1311,7 @@ def main() -> None:
         .token(token)
         .arbitrary_callback_data(True)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
 
@@ -1304,8 +1325,9 @@ def main() -> None:
     app.add_handler(CommandHandler("view",     cmd_view))
     app.add_handler(CommandHandler("merge",    cmd_merge))
     app.add_handler(CommandHandler("delete",   cmd_delete))
-    app.add_handler(CommandHandler("render",   cmd_render))
-    app.add_handler(CommandHandler("maintain", cmd_maintain))
+    app.add_handler(CommandHandler("render",      cmd_render))
+    app.add_handler(CommandHandler("end_session", cmd_end_session))
+    app.add_handler(CommandHandler("maintain",    cmd_maintain))
 
     # Inline keyboard callbacks (Regenerate / Branch here)
     app.add_handler(CallbackQueryHandler(cmd_callback))
