@@ -34,7 +34,7 @@ from langgraph.types import Command
 from agent.context import Context
 from agent.logging_config import setup_logging
 from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_png, switch_active, write_session
-from agent.graph import flush_all_sessions, flush_session, graph, start_session_flusher
+from agent.graph import cancel_session_flusher, flush_all_sessions, flush_session, graph, start_session_flusher
 from agent.state import InputState
 from agent.utils import get_message_text
 
@@ -165,11 +165,59 @@ def _extract_block_math(text: str) -> tuple[str, list[str]]:
     return cleaned.strip(), formulas
 
 
+# CJK font file candidates in priority order.
+# WSL2 can read Windows fonts directly under /mnt/c/Windows/Fonts/.
+_CJK_FONT_PATHS = [
+    "/mnt/c/Windows/Fonts/msjh.ttc",          # 微軟正黑體 (Traditional Chinese)
+    "/mnt/c/Windows/Fonts/NotoSansTC-VF.ttf",  # Noto Sans TC
+    "/mnt/c/Windows/Fonts/kaiu.ttf",           # 標楷體
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",  # Linux Noto
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+]
+_cjk_font_cache: list[str | None] = [False]  # type: ignore[list-item]  # False = not yet probed
+
+
+def _find_cjk_font() -> str | None:
+    """Return path to the first available CJK font file, or None."""
+    if _cjk_font_cache[0] is not False:
+        return _cjk_font_cache[0]  # type: ignore[return-value]
+    import os
+    for path in _CJK_FONT_PATHS:
+        if os.path.exists(path):
+            logger.info("CJK font selected for formula rendering: %s", path)
+            _cjk_font_cache[0] = path
+            return path
+    logger.warning("No CJK font found; \\text{} with Chinese will render as boxes")
+    _cjk_font_cache[0] = None
+    return None
+
+
 def _render_formula_png(formula: str) -> io.BytesIO:
     """Render a LaTeX display-math formula to a PNG image using matplotlib.mathtext."""
+    import logging as _logging
     import matplotlib  # lazy import — only needed when formulas are present
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+
+    # Load CJK font so \text{中文} inside mathtext renders correctly.
+    # rcParams["font.family"] only affects regular text; mathtext \text{} uses
+    # the "rm" slot from the mathtext font set, so we must use fontset="custom"
+    # and point mathtext.rm at the CJK font.
+    cjk_font_path = _find_cjk_font()
+    if cjk_font_path:
+        fm.fontManager.addfont(cjk_font_path)
+        font_name = fm.FontProperties(fname=cjk_font_path).get_name()
+        matplotlib.rcParams["mathtext.fontset"] = "custom"
+        matplotlib.rcParams["mathtext.rm"] = font_name
+        matplotlib.rcParams["mathtext.it"] = font_name
+        matplotlib.rcParams["mathtext.bf"] = font_name
+
+    # Silence matplotlib.mathtext WARNING/INFO that fire for every unrenderable
+    # glyph — these are expected fallbacks, not actionable errors.
+    _mpl_log = _logging.getLogger("matplotlib")
+    _prev_level = _mpl_log.level
+    _mpl_log.setLevel(_logging.ERROR)
 
     fig = plt.figure(figsize=(8, 1.5))
     fig.patch.set_facecolor("white")
@@ -180,6 +228,7 @@ def _render_formula_png(formula: str) -> io.BytesIO:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=150, pad_inches=0.3)
     plt.close(fig)
+    _mpl_log.setLevel(_prev_level)
     buf.seek(0)
     return buf
 
@@ -651,8 +700,9 @@ async def run_agent_streaming(
                     message_thread_id=message_thread_id,
                     parse_mode=ParseMode.HTML,
                 )
+                logger.debug("[push] draft flush  phase=%d  len=%d", phase, len(text))
             except Exception:
-                logger.debug("send_message_draft failed (suppressed)")
+                logger.debug("[push] send_message_draft failed (suppressed)")
 
     _draft_flush_task_holder[0] = asyncio.create_task(_flush_loop())
 
@@ -668,18 +718,25 @@ async def run_agent_streaming(
         _draft_buf[0] = ""
 
     def _p1_draft() -> str:
-        text = "\n".join(steps)
+        # Display raw thinking content in Phase 1; steps[] keeps the status
+        # line ("🧠 正在推理（N 字）...") for _compress_steps() to use later.
+        display = list(steps)
+        if thinking_buf and thinking_step_idx >= 0:
+            display[thinking_step_idx] = _md_to_html(thinking_buf)
+        text = "\n".join(display)
         if len(text) >= _P1_HARD:
             return text[:_P1_HARD - 12] + "\n⚠️ 已達預覽上限"
         return text
 
     async def _dot_pad() -> None:
         nonlocal p1_truncated
+        logger.info("[push] dot_pad start  content_len=%d", len("\n".join(steps)))
         while True:
             await asyncio.sleep(1)
             content = "\n".join(steps)
             if len(content) >= _P1_HARD:
                 p1_truncated = True
+                logger.info("[push] dot_pad P1_HARD reached → truncated")
                 _draft(_p1_draft())
                 return
             if steps:
@@ -688,28 +745,53 @@ async def run_agent_streaming(
 
     def _maybe_start_dot_task() -> asyncio.Task | None:  # type: ignore[type-arg]
         if not p1_truncated and len("\n".join(steps)) >= _P1_SOFT:
+            logger.info("[push] dot_pad triggered  content_len=%d", len("\n".join(steps)))
             return asyncio.create_task(_dot_pad())
         return None
 
     def _compress_steps() -> str:
-        """Compress raw steps into a single <blockquote expandable> for phase 2."""
+        """Compress raw steps into a single <blockquote expandable> for phase 2.
+
+        Format (each search tool call):
+          ✅ 已搜尋：「query」
+            • <a href="url">url</a>
+            • ...
+        Followed by thinking summary (if any).
+        """
         summary_lines: list[str] = []
         for s in steps:
-            if s.startswith("✅"):
-                summary_lines.append(s.split("\n")[0])
+            if not s.startswith("✅"):
+                continue
+            lines = s.split("\n")
+            summary_lines.append(lines[0])          # ✅ 已搜尋：「...」
+            for raw in lines[1:]:                   # "  • https://..."
+                url = raw.strip().lstrip("• ").strip()
+                if url:
+                    summary_lines.append(f'  • <a href="{url}">{url}</a>')
+
         if thinking_buf:
-            heading = re.search(r"^##\s+(.+)$", thinking_buf, re.MULTILINE)
-            if heading:
-                thought = heading.group(1).strip()
+            headings = re.findall(r"^#{1,6}\s+(.+)$", thinking_buf, re.MULTILINE)
+            if headings:
+                for h in headings:
+                    summary_lines.append(f"🧠 {_h(h.strip())}")
+                logger.debug("[push] compress_steps thinking  headings=%d", len(headings))
             else:
-                parts = thinking_buf.split("\n\n")
-                first = parts[0].strip() if parts else ""
-                m = re.search(r"[^。.!?！？]+[。.!?！？]?", first)
-                thought = m.group(0).strip() if m else ""
-            if thought:
-                summary_lines.append(f"🧠 {_h(thought)}")
-            else:
-                summary_lines.append(f"🧠 已推理（{len(thinking_buf)} 字）")
+                # Fallback: first sentence of each \n\n paragraph
+                sentences: list[str] = []
+                for para in thinking_buf.split("\n\n"):
+                    para = para.strip()
+                    if not para:
+                        continue
+                    m = re.search(r"[^。.!?！？\n]+[。.!?！？]?", para)
+                    if m:
+                        sentences.append(m.group(0).strip())
+                if sentences:
+                    for s in sentences:
+                        summary_lines.append(f"🧠 {_h(s)}")
+                    logger.debug("[push] compress_steps thinking  sentences=%d", len(sentences))
+                else:
+                    summary_lines.append(f"🧠 已推理（{len(thinking_buf)} 字）")
+
         if not summary_lines:
             return ""
         inner = "\n".join(summary_lines)
@@ -725,7 +807,10 @@ async def run_agent_streaming(
         summary = _compress_steps()
         parts = [p for p in [summary, answer_html] if p]
         full = "\n\n".join(parts)
-        for chunk in _split_answer(full):
+        chunks = _split_answer(full)
+        logger.info("[push] send_segment  chunks=%d  total_len=%d  has_blockquote=%s",
+                    len(chunks), len(full), bool(summary))
+        for i, chunk in enumerate(chunks):
             msg = await bot.send_message(  # type: ignore[attr-defined]
                 chat_id,
                 text=chunk,
@@ -733,6 +818,8 @@ async def run_agent_streaming(
                 parse_mode=ParseMode.HTML,
             )
             sent_messages.append(msg.message_id)
+            logger.info("[push] sent chunk %d/%d  msg_id=%d  len=%d",
+                        i + 1, len(chunks), msg.message_id, len(chunk))
 
     # --- Event loop ---
 
@@ -749,6 +836,7 @@ async def run_agent_streaming(
             answer_buf = ""
             thinking_buf = ""
             thinking_step_idx = -1
+            logger.info("[push] model_start  phase=%d  steps=%d", phase, len(steps))
             _draft(_p1_draft() or "🤔 正在思考...")
 
         elif evt == "on_tool_start":
@@ -758,6 +846,8 @@ async def run_agent_streaming(
 
             if phase == 2 and answer_buf.strip():
                 # Finalize current answer segment before new tool call
+                logger.info("[push] tool_start mid-answer  tool=%s  answer_len=%d → send_segment",
+                            tool_name, len(answer_buf))
                 if dot_task:
                     dot_task.cancel()
                 await _send_segment(_md_to_html(answer_buf))
@@ -767,9 +857,11 @@ async def run_agent_streaming(
             if tool_name == "search":
                 current_query = str(tool_input.get("query", ""))
                 steps.append(f"⏳ 正在{label}：「{_h(current_query[:60])}」")
+                logger.info("[push] tool_start  tool=search  query=%r  phase=%d", current_query[:60], phase)
             else:
                 current_query = None
                 steps.append(f"⏳ 正在執行：{_h(label)}")
+                logger.info("[push] tool_start  tool=%s  phase=%d", tool_name, phase)
 
             if phase == 1:
                 dot_task = _maybe_start_dot_task()
@@ -794,8 +886,11 @@ async def run_agent_streaming(
                                     result_urls.append(url)
                         url_lines = "".join(f"\n  • {u}" for u in result_urls[:5])
                         steps[i] = f"✅ 已{label}：「{_h(current_query[:60])}」{url_lines}"
+                        logger.info("[push] tool_end  tool=search  urls=%d  phase=%d",
+                                    len(result_urls), phase)
                     else:
                         steps[i] = steps[i].replace("⏳ 正在", "✅ 已完成", 1)
+                        logger.info("[push] tool_end  tool=%s  phase=%d", tool_name, phase)
                     break
             current_query = None
 
@@ -823,6 +918,7 @@ async def run_agent_streaming(
                         if not thinking_buf:
                             steps.append("🧠 正在推理...")
                             thinking_step_idx = len(steps) - 1
+                            logger.info("[push] thinking_start  phase=%d", phase)
                         thinking_buf += btext
                         if thinking_step_idx >= 0:
                             steps[thinking_step_idx] = f"🧠 正在推理（{len(thinking_buf)} 字）..."
@@ -841,6 +937,8 @@ async def run_agent_streaming(
                             if thinking_step_idx >= 0:
                                 thinking_step_idx = -1
                             phase = 2
+                            logger.info("[push] phase 1→2  steps=%d  thinking_len=%d  p1_content_len=%d",
+                                        len(steps), len(thinking_buf), len("\n".join(steps)))
                         answer_buf += btext
                         _draft(_p2_draft(_md_to_html(answer_buf)))
 
@@ -856,6 +954,7 @@ async def run_agent_streaming(
     state = await graph.aget_state(config)
     all_interrupts = [i for task in state.tasks for i in task.interrupts]
     if all_interrupts:
+        logger.info("[push] interrupt detected  count=%d", len(all_interrupts))
         interrupt_val = all_interrupts[0].value
         question: str = (
             interrupt_val.get("question", "") if isinstance(interrupt_val, dict) else str(interrupt_val)
@@ -907,6 +1006,7 @@ async def run_agent_streaming(
         except Exception:
             logger.exception("Failed to render formula: %s", formula[:80])
 
+    logger.info("[push] done  sent=%s  last_node=%s", sent_messages, last_node_id)
     return sent_messages, last_node_id
 
 
@@ -1532,6 +1632,7 @@ async def _post_init(app) -> None:  # type: ignore[type-arg]
 
 async def _post_shutdown(app) -> None:  # type: ignore[type-arg]
     """Flush all open sessions on graceful shutdown."""
+    cancel_session_flusher()
     await flush_all_sessions()
     logger.info("All sessions flushed on shutdown")
 

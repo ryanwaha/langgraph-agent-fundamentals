@@ -313,9 +313,19 @@ async def _session_watchdog() -> None:
             logger.info("Session timed out: thread=%s", tid)
 
 
+_watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
+
+
 def start_session_flusher() -> None:
     """Schedule the session watchdog. Call once after the event loop is running."""
-    asyncio.get_event_loop().create_task(_session_watchdog())
+    global _watchdog_task
+    _watchdog_task = asyncio.get_event_loop().create_task(_session_watchdog())
+
+
+def cancel_session_flusher() -> None:
+    """Cancel the session watchdog task (call on shutdown)."""
+    if _watchdog_task and not _watchdog_task.done():
+        _watchdog_task.cancel()
 
 
 # ---------------------------------------------------------------------------
