@@ -66,14 +66,11 @@ def build_dag_context(dag_graph: Graph) -> str:
 
     builder = PromptBuilder(
         include_summary=False,
-        include_time_flow=True,
+        include_time_flow=False,  # narrative disabled for now
         prompt_dump_path=None,
     )
 
-    sections: list[str] = []
-    sections.append(builder._render_conversation(nodes, graph=dag_graph))
-    sections.append(builder._render_time_flow(dag_graph))
-    return "\n\n".join(sections)
+    return builder._render_conversation(nodes, graph=dag_graph)
 
 
 def build_merge_context(dag_graph: Graph, parent_ids: list[str]) -> str:
@@ -96,11 +93,8 @@ def build_merge_context(dag_graph: Graph, parent_ids: list[str]) -> str:
 
     builder = PromptBuilder(
         include_summary=False,
-        include_time_flow=True,
+        include_time_flow=False,  # narrative disabled for now
         prompt_dump_path=None,
     )
 
-    sections: list[str] = []
-    sections.append(builder._render_conversation(merged, graph=dag_graph))
-    sections.append(builder._render_time_flow(dag_graph))
-    return "\n\n".join(sections)
+    return builder._render_conversation(merged, graph=dag_graph)
