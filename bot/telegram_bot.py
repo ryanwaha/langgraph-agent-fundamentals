@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 JSONL_DIR = Path("jsonls")
 
-# markdown-it-py parser (CommonMark spec; used by _md_to_html)
-_MD = MarkdownIt("commonmark")
+# markdown-it-py parser (CommonMark + tables plugin; used by _md_to_html)
+_MD = MarkdownIt("commonmark").enable("table")
 
 # Per-thread asyncio Lock: prevents concurrent agent invocations on the same thread.
 # defaultdict(asyncio.Lock) creates a new Lock lazily for each thread_id.
@@ -92,6 +92,66 @@ def _classify_error(exc: BaseException) -> str:
     return f"發生錯誤：{type(exc).__name__}"
 
 
+def _dw(s: str) -> int:
+    """Display width of a string: CJK full-width chars count as 2, others as 1."""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def _ljust_dw(s: str, width: int) -> str:
+    """Left-justify s to display width, padding with spaces."""
+    return s + " " * max(0, width - _dw(s))
+
+
+def _table_to_pre(html_table: str) -> str:
+    """Convert an HTML <table> block to a monospace <pre> block for Telegram.
+
+    Telegram's HTML mode does not support <table>, so we render the cells as
+    space-aligned plain text inside a <pre> tag.
+
+    Example input (from markdown-it-py):
+        <table><thead><tr><th>Name</th><th>Score</th></tr></thead>
+               <tbody><tr><td>Alice</td><td>95</td></tr></tbody></table>
+
+    Example output:
+        <pre>Name   Score
+        -----  -----
+        Alice  95</pre>
+    """
+    # Extract all rows: each <tr> becomes a list of cell texts
+    rows: list[list[str]] = []
+    is_header_row: list[bool] = []
+    for tr_match in re.finditer(r"<tr>(.*?)</tr>", html_table, re.DOTALL):
+        row_html = tr_match.group(1)
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row_html, re.DOTALL)
+        # Strip any nested tags from cell text
+        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+        if cells:
+            rows.append(cells)
+            is_header_row.append("<th" in row_html)
+
+    if not rows:
+        return ""
+
+    # Determine column widths
+    col_count = max(len(r) for r in rows)
+    col_widths = [0] * col_count
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], _dw(cell))
+
+    lines: list[str] = []
+    for idx, (row, is_header) in enumerate(zip(rows, is_header_row)):
+        padded = [_ljust_dw(cell, col_widths[i]) for i, cell in enumerate(row)]
+        lines.append("  ".join(padded).rstrip())
+        # Insert separator after the header row
+        if is_header:
+            sep = ["-" * col_widths[i] for i in range(len(row))]
+            lines.append("  ".join(sep).rstrip())
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
 def _md_to_html(text: str) -> str:
     """Convert LLM Markdown to Telegram HTML using markdown-it-py (CommonMark).
 
@@ -99,6 +159,18 @@ def _md_to_html(text: str) -> str:
     blocks correctly.  Output is post-processed to map standard HTML tags to
     Telegram's whitelist: b, i, s, u, code, pre, a, tg-spoiler.
     """
+    # Insert ZWS between CJK full-width punctuation and a closing ** delimiter.
+    # CommonMark right-flanking rule: if preceded by Unicode punctuation, the
+    # closing ** must be followed by whitespace or punctuation.  When bold ends
+    # with a CJK bracket (e.g. **text（content）**的說明), the closing ** is
+    # preceded by ） (punct) and followed by 的 (CJK letter, non-punct) →
+    # right-flanking check fails → rendered literally.  ZWS (U+200B, category
+    # Cf) inserted before the ** makes the delimiter "preceded by non-punct"
+    # so right-flanking succeeds, without breaking any surrounding text.
+    _CJK_PUNCT = r"[（）「」【】〔〕『』，。！？：；、﹐﹑﹒﹔﹕]"
+    _ZWS = "\u200b"
+    text = re.sub(rf"({_CJK_PUNCT})([*_~`])", rf"\1{_ZWS}\2", text)
+
     html_out = _MD.render(text)
     # Map standard HTML → Telegram HTML whitelist
     html_out = re.sub(r"<strong>(.*?)</strong>", r"<b>\1</b>", html_out, flags=re.DOTALL)
@@ -112,6 +184,8 @@ def _md_to_html(text: str) -> str:
     html_out = re.sub(r"<li>(.*?)</li>", r"• \1\n", html_out, flags=re.DOTALL)
     # Strip list/blockquote wrapper tags
     html_out = re.sub(r"</?(?:ul|ol|blockquote)[^>]*>", "", html_out)
+    # Tables → monospace <pre> blocks (Telegram doesn't support <table>)
+    html_out = re.sub(r"<table>.*?</table>", lambda m: _table_to_pre(m.group(0)), html_out, flags=re.DOTALL)
     # Strip any remaining non-whitelisted tags
     html_out = re.sub(
         r"</?(?!(?:b|i|s|u|code|pre|a|tg-spoiler)(?:\s|>|/))[a-zA-Z][^>]*>", "", html_out
