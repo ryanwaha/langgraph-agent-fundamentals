@@ -28,9 +28,11 @@ from telegram.ext import (
     filters,
 )
 
+from langgraph.types import Command
+
 from agent.context import Context
-from agent.dag import Graph, Node, append_node, delete_node, load, maintain, render_topology_svg, switch_active, write_session
-from agent.graph import _dag_cache, graph
+from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_svg, switch_active, write_session
+from agent.graph import graph
 from agent.state import InputState
 from agent.utils import get_message_text
 
@@ -52,13 +54,18 @@ _thread_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # cancelled before the LLM is ever called (OpenClaw-validated window).
 _pending_tasks: dict[str, asyncio.Task] = {}
 
-# Pending merge: thread_id → list of parent node IDs.
+# Pending merge: dag_thread_id → list of parent node IDs.
 # Set by /merge, consumed by handle_message on next user text.
 _pending_merges: dict[str, list[str]] = {}
+
+# Pending interrupt: dag_thread_id → invoke_id.
+# Set when the agent calls ask_user (interrupt); consumed on the next user reply.
+_pending_invoke: dict[str, str] = {}
 
 # Human-readable labels for tool names (extend when new tools are added)
 _TOOL_LABELS: dict[str, str] = {
     "search": "搜尋網頁",
+    "ask_user": "詢問使用者",
 }
 
 
@@ -379,40 +386,47 @@ def _view_format(
 # ---------------------------------------------------------------------------
 
 
-async def run_agent(user_message: str, thread_id: str) -> str:
-    """Invoke the LangGraph agent and return its answer.
-
-    DAG lifecycle (load → build context → append node → write session)
-    is handled inside the agent graph nodes.
-    """
-    config = RunnableConfig(configurable={"thread_id": thread_id})
-    result = await graph.ainvoke(
-        InputState(messages=[HumanMessage(content=user_message)]),
-        config=config,
-        context=Context(),
-    )
-    return get_message_text(result["messages"][-1])
-
-
 async def run_agent_streaming(
     user_message: str,
-    thread_id: str,
+    dag_thread_id: str,
+    invoke_id: str,
     bot: object,
     chat_id: int,
     message_thread_id: int | None,
-) -> Message:
-    """Stream agent execution via sendMessageDraft (forum topic mode).
+    *,
+    resume_value: str | None = None,
+    merge_parents: list[str] | None = None,
+) -> tuple[Message | None, str | None]:
+    """Stream agent execution via sendMessageDraft.
 
-    Sends animated draft bubbles while the agent is running, then publishes
-    the final answer as a real message.  Returns the published Message so the
-    caller can attach an inline keyboard.
+    On normal completion returns (final_message, last_node_id).
+    If the agent interrupts (e.g. ask_user tool), sends the question to the
+    user and returns (None, None) — the invoke_id is stored in _pending_invoke
+    so the next user reply resumes it.
+
+    Args:
+        user_message:   Original user text (used for the draft header).
+        dag_thread_id:  Telegram thread ID — keys the JSONL/DAG files.
+        invoke_id:      Per-invoke ULID — keys the LangGraph checkpointer.
+        resume_value:   If set, resumes a paused interrupt instead of new invoke.
+        merge_parents:  DAG parent IDs for /merge, forwarded via configurable.
     """
-    config = RunnableConfig(configurable={"thread_id": thread_id})
+    configurable: dict = {"thread_id": invoke_id, "dag_thread_id": dag_thread_id}
+    if merge_parents:
+        configurable["merge_parents"] = merge_parents
+    config = RunnableConfig(configurable=configurable)
+
+    input_data = (
+        Command(resume=resume_value)
+        if resume_value is not None
+        else InputState(messages=[HumanMessage(content=user_message)])
+    )
 
     header = f"💬 <b>用戶說：</b>{_h(user_message[:100])}"
     steps: list[str] = []
     current_query: str | None = None
     answer_buf = ""
+    last_node_id: str | None = None
 
     def _build(extra: str = "", spoiler_steps: bool = False) -> str:
         parts = [header]
@@ -436,7 +450,7 @@ async def run_agent_streaming(
             logger.exception("send_message_draft failed")
 
     async for event in graph.astream_events(
-        InputState(messages=[HumanMessage(content=user_message)]),
+        input_data,
         config=config,
         context=Context(),
         version="v2",
@@ -481,20 +495,59 @@ async def run_agent_streaming(
                     answer_buf += token
                     await _draft(_build(_md_to_html(answer_buf)))
 
+        elif evt == "on_chain_end" and node == "":
+            # Top-level graph completion: capture last_node_id from output state
+            output = event["data"].get("output") or {}
+            last_node_id = output.get("last_node_id") or last_node_id
+
+    # Check if the graph paused at an interrupt (e.g. ask_user tool)
+    state = await graph.aget_state(config)
+    all_interrupts = [i for task in state.tasks for i in task.interrupts]
+    if all_interrupts:
+        interrupt_val = all_interrupts[0].value
+        question: str = (
+            interrupt_val.get("question", "") if isinstance(interrupt_val, dict) else str(interrupt_val)
+        )
+        options: list[str] = (
+            interrupt_val.get("options", []) if isinstance(interrupt_val, dict) else []
+        )
+        q_text = f"❓ <b>Agent 詢問：</b>\n{_h(question)}"
+        if options:
+            rows = [
+                [InlineKeyboardButton(
+                    opt,
+                    callback_data={"a": "ask_reply", "tid": dag_thread_id, "iid": invoke_id, "ans": opt},
+                )]
+                for opt in options
+            ]
+            await bot.send_message(  # type: ignore[attr-defined]
+                chat_id, text=q_text,
+                message_thread_id=message_thread_id,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        else:
+            await bot.send_message(  # type: ignore[attr-defined]
+                chat_id, text=q_text,
+                message_thread_id=message_thread_id,
+                parse_mode=ParseMode.HTML,
+            )
+        _pending_invoke[dag_thread_id] = invoke_id
+        return None, None
+
     final_answer = answer_buf.strip()
     final_text = (
         _build(_md_to_html(final_answer), spoiler_steps=True)
         if final_answer
         else _build("(無回應)", spoiler_steps=True)
     )
-    # Publish the final answer as a real message (replaces the draft bubble)
     final_msg: Message = await bot.send_message(  # type: ignore[attr-defined]
         chat_id,
         text=final_text,
         message_thread_id=message_thread_id,
         parse_mode=ParseMode.HTML,
     )
-    return final_msg
+    return final_msg, last_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -533,10 +586,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("How can I help you? Ask me anything!")
         return
 
-    thread_id = _thread_id(message)
+    dag_thread_id = _thread_id(message)
 
     # Cancel any in-flight debounce task for this thread
-    existing = _pending_tasks.get(thread_id)
+    existing = _pending_tasks.get(dag_thread_id)
     if existing and not existing.done():
         existing.cancel()
 
@@ -551,30 +604,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass
 
-        # If a /merge is pending, attach parent IDs so graph.py uses them
-        pending_merge = _pending_merges.pop(thread_id, None)
-        if pending_merge:
-            dag = _dag_cache.get(thread_id)
-            if dag:
-                dag._merge_parents = pending_merge  # type: ignore[attr-defined]
+        # /merge pending: pass parent IDs via configurable to graph.py
+        pending_merge = _pending_merges.pop(dag_thread_id, None)
 
-        node_id: str | None = None
-        async with _thread_locks[thread_id]:
+        # Resume a paused interrupt if one exists, otherwise start a new invoke
+        pending_invoke_id = _pending_invoke.pop(dag_thread_id, None)
+        if pending_invoke_id:
+            invoke_id = pending_invoke_id
+            resume_val: str | None = user_text
+        else:
+            invoke_id = generate_id()
+            resume_val = None
+
+        async with _thread_locks[dag_thread_id]:
             try:
-                final_msg = await run_agent_streaming(
+                final_msg, node_id = await run_agent_streaming(
                     user_text,
-                    thread_id,
+                    dag_thread_id,
+                    invoke_id,
                     context.bot,
                     message.chat_id,
                     message.message_thread_id,
+                    resume_value=resume_val,
+                    merge_parents=pending_merge,
                 )
             except Exception as exc:
-                logger.exception("Agent invocation failed for thread %s", thread_id)
+                logger.exception("Agent invocation failed for thread %s", dag_thread_id)
                 await message.reply_text(f"Sorry, I encountered an error: {exc}")
                 return
 
+        if final_msg is None:
+            # Agent interrupted — question already sent; show a thinking reaction
+            try:
+                await message.set_reaction([ReactionTypeEmoji("🤔")])
+            except Exception:
+                pass
+            return
+
         # Attach inline keyboard (Regenerate / Branch here)
-        kb = _make_reply_keyboard(thread_id, user_text, node_id)
+        kb = _make_reply_keyboard(dag_thread_id, user_text, node_id)
         try:
             await final_msg.edit_reply_markup(reply_markup=kb)
         except Exception:
@@ -587,7 +655,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass
 
     task = asyncio.create_task(_run())
-    _pending_tasks[thread_id] = task
+    _pending_tasks[dag_thread_id] = task
 
 
 # ---------------------------------------------------------------------------
@@ -613,16 +681,17 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         old_msg = query.message
         chat_id_regen: int = old_msg.chat_id
         thread_id_regen: int | None = old_msg.message_thread_id
-        # Delete the old answer; new answer comes from run_agent_streaming
         try:
             await old_msg.delete()
         except Exception:
             pass
+        invoke_id_regen = generate_id()
         async with _thread_locks[thread_id]:
             try:
-                final_msg = await run_agent_streaming(
+                final_msg, regen_node_id = await run_agent_streaming(
                     user_message,
                     thread_id,
+                    invoke_id_regen,
                     context.bot,
                     chat_id_regen,
                     thread_id_regen,
@@ -630,11 +699,53 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except Exception as exc:
                 await context.bot.send_message(chat_id_regen, text=f"Error: {exc}", message_thread_id=thread_id_regen)
                 return
-        kb = _make_reply_keyboard(thread_id, user_message, node_id)
+        if final_msg is not None:
+            kb = _make_reply_keyboard(thread_id, user_message, regen_node_id)
+            try:
+                await final_msg.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
+
+    elif action == "ask_reply":
+        # Resume a paused ask_user interrupt from an inline button tap
+        iid: str = data.get("iid", "")
+        ans: str = data.get("ans", "")
+        if not iid or not thread_id:
+            return
+        # Consume pending_invoke (button tap wins over any pending text)
+        _pending_invoke.pop(thread_id, None)
+        old_msg = query.message
+        chat_id_ask: int = old_msg.chat_id
+        thread_id_ask: int | None = old_msg.message_thread_id
+        # Edit button message to show selected answer
         try:
-            await final_msg.edit_reply_markup(reply_markup=kb)
+            await old_msg.edit_text(
+                old_msg.text_html + f"\n\n<b>✅ 選擇：</b>{_h(ans)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
         except Exception:
             pass
+        async with _thread_locks[thread_id]:
+            try:
+                final_msg, ask_node_id = await run_agent_streaming(
+                    ans,
+                    thread_id,
+                    iid,
+                    context.bot,
+                    chat_id_ask,
+                    thread_id_ask,
+                    resume_value=ans,
+                )
+            except Exception as exc:
+                await context.bot.send_message(chat_id_ask, text=f"Error: {exc}", message_thread_id=thread_id_ask)
+                return
+        if final_msg is not None:
+            kb = _make_reply_keyboard(thread_id, ans, ask_node_id)
+            try:
+                await final_msg.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
 
     elif action == "branch":
         node_id: str = data.get("nid", "")
@@ -652,8 +763,6 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             switch_active(dag_graph, jsonl_path, target_id)
             write_session(dag_graph, jsonl_path)
-            if thread_id in _dag_cache:
-                _dag_cache[thread_id].active_node = target_id
             await query.answer(f"✅ Branched to {target_id[:8]}", show_alert=False)
         except Exception as exc:
             await query.answer(f"Error: {exc}", show_alert=True)
@@ -705,8 +814,6 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 switch_active(dag_graph, jsonl_path, nid)
                 write_session(dag_graph, jsonl_path)
-                if tid in _dag_cache:
-                    _dag_cache[tid].active_node = nid
                 await query.answer(f"✅ Active → {nid[:8]}", show_alert=False)
             except Exception as exc:
                 await query.answer(f"Error: {exc}", show_alert=True)
@@ -733,8 +840,6 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if dag_graph.active_node == nid:
                 dag_graph.active_node = node.parents[0] if node.parents else None
             write_session(dag_graph, jsonl_path)
-            if tid in _dag_cache:
-                _dag_cache[tid] = dag_graph
             await query.answer(f"🗑 Deleted {nid[:8]}", show_alert=False)
             # Re-render at parent (or just close if no parent)
             retreat_id = node.parents[0] if node.parents else None

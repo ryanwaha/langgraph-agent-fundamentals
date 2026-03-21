@@ -70,6 +70,10 @@ def build_dag_context(dag_graph: Graph) -> str:
         prompt_dump_path=None,
     )
 
+    # NOTE: _render_conversation is a private method. We call it directly because
+    # the public build_from_nodes() always appends <user_query>, which would
+    # duplicate the HumanMessage already in state.messages. When PromptBuilder
+    # gains a public render_context_only() method, replace this call.
     return builder._render_conversation(nodes, graph=dag_graph)
 
 
@@ -97,4 +101,5 @@ def build_merge_context(dag_graph: Graph, parent_ids: list[str]) -> str:
         prompt_dump_path=None,
     )
 
+    # NOTE: same reason as build_dag_context — see comment above.
     return builder._render_conversation(merged, graph=dag_graph)

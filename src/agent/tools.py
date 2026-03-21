@@ -10,6 +10,7 @@ from typing import Any, Callable, List, Optional, cast
 
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
+from langgraph.types import interrupt
 
 from agent.context import Context
 
@@ -33,3 +34,15 @@ async def search(query: str) -> Optional[dict[str, Any]]:
     runtime = get_runtime(Context)
     wrapped = TavilySearch(max_results=runtime.context.max_search_results)
     return cast(dict[str, Any], await wrapped.ainvoke({"query": query}))
+
+
+@register_tool
+def ask_user(question: str, options: list[str] | None = None) -> str:
+    """Ask the user a clarifying question and wait for their response.
+
+    Use when the user's intent is ambiguous or you need more information
+    to answer accurately.  Optionally provide a list of suggested answers
+    that will be shown as Telegram inline buttons.
+    """
+    answer = interrupt({"question": question, "options": options or []})
+    return str(answer)

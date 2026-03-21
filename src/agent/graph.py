@@ -12,6 +12,7 @@ from typing import Dict, Literal, cast
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
@@ -95,14 +96,19 @@ async def call_model(
 ) -> dict:
     """Call the LLM powering the agent."""
     # Load DAG on first entry; reuse from cache on ReAct re-entries (after tools)
-    thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
-    if thread_id not in _dag_cache:
-        jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
+    dag_thread_id: str = config["configurable"]["dag_thread_id"]  # type: ignore[index]
+    if dag_thread_id not in _dag_cache:
+        jsonl_path = JSONL_DIR / f"{dag_thread_id}.jsonl"
         await asyncio.to_thread(JSONL_DIR.mkdir, parents=True, exist_ok=True)
         if not await asyncio.to_thread(jsonl_path.exists):
-            await asyncio.to_thread(init_jsonl, jsonl_path, graph_id=thread_id)
-        _dag_cache[thread_id] = await asyncio.to_thread(load, jsonl_path)
-    dag_graph = _dag_cache[thread_id]
+            await asyncio.to_thread(init_jsonl, jsonl_path, graph_id=dag_thread_id)
+        _dag_cache[dag_thread_id] = await asyncio.to_thread(load, jsonl_path)
+    dag_graph = _dag_cache[dag_thread_id]
+
+    # Merge parents can be passed via configurable (set by telegram_bot on /merge)
+    merge_parents_cfg = config["configurable"].get("merge_parents")  # type: ignore[index]
+    if merge_parents_cfg:
+        dag_graph._merge_parents = merge_parents_cfg  # type: ignore[attr-defined]
 
     model = load_chat_model(runtime.context.model).bind_tools(TOOLS)
 
@@ -145,9 +151,9 @@ async def summarize(
     """Summarize the Q-A exchange and persist to DAG."""
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
-    thread_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
-    dag_graph = _dag_cache[thread_id]  # always populated by call_model
-    jsonl_path = JSONL_DIR / f"{thread_id}.jsonl"
+    dag_thread_id: str = config["configurable"]["dag_thread_id"]  # type: ignore[index]
+    dag_graph = _dag_cache[dag_thread_id]  # always populated by call_model
+    jsonl_path = JSONL_DIR / f"{dag_thread_id}.jsonl"
 
     # Extract tool calls with success/fail from ToolMessages
     tool_msg_map: dict[str, ToolMessage] = {
@@ -165,7 +171,7 @@ async def summarize(
 
     # Pre-generate ULID so log entry and DAG node share the same ID
     node_id = generate_id()
-    log_ref = await _write_tool_log(thread_id, node_id, tools_used) if tools_used else None
+    log_ref = await _write_tool_log(dag_thread_id, node_id, tools_used) if tools_used else None
 
     # Generate summary
     model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
@@ -181,7 +187,7 @@ async def summarize(
     except Exception:
         logger.warning(
             "summarize: LLM call failed for thread %s, falling back to truncated query",
-            thread_id,
+            dag_thread_id,
             exc_info=True,
         )
         summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
@@ -206,7 +212,7 @@ async def summarize(
     )
     dag_graph.active_node = new_node.id
     await asyncio.to_thread(write_session, dag_graph, jsonl_path)
-    _dag_cache.pop(thread_id, None)
+    _dag_cache.pop(dag_thread_id, None)
 
     return {"summary": summary_text, "last_node_id": node_id}
 
@@ -239,4 +245,4 @@ builder.add_conditional_edges("call_model", route_model_output)
 builder.add_edge("tools", "call_model")
 builder.add_edge("summarize", "__end__")
 
-graph = builder.compile(name="ReAct Agent")
+graph = builder.compile(name="ReAct Agent", checkpointer=InMemorySaver())
