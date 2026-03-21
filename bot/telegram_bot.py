@@ -31,6 +31,7 @@ from telegram.ext import (
 from langgraph.types import Command
 
 from agent.context import Context
+from agent.logging_config import setup_logging
 from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_svg, switch_active, write_session
 from agent.graph import graph
 from agent.state import InputState
@@ -72,6 +73,23 @@ _TOOL_LABELS: dict[str, str] = {
 def _h(text: str) -> str:
     """HTML-escape text for safe insertion into HTML-mode Telegram messages."""
     return html.escape(text)
+
+
+def _classify_error(exc: BaseException) -> str:
+    """Return a user-friendly error description based on exception type/message."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "timeout" in name or "timeout" in msg or "timed out" in msg:
+        return "網路逾時，請稍後再試"
+    if "connect" in name or "connection" in msg or "network" in msg:
+        return "網路連線錯誤，請稍後再試"
+    if "429" in msg or "quota" in msg or "resource exhausted" in msg or "rate limit" in msg:
+        return "API 配額超限，請稍後再試"
+    if "503" in msg or "unavailable" in msg or "overloaded" in msg:
+        return "模型服務暫時無法使用，請稍後再試"
+    if "401" in msg or "403" in msg or "unauthorized" in msg or "forbidden" in msg:
+        return "API 驗證錯誤，請檢查設定"
+    return f"發生錯誤：{type(exc).__name__}"
 
 
 def _md_to_html(text: str) -> str:
@@ -630,7 +648,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
             except Exception as exc:
                 logger.exception("Agent invocation failed for thread %s", dag_thread_id)
-                await message.reply_text(f"Sorry, I encountered an error: {exc}")
+                await message.reply_text(f"⚠️ {_classify_error(exc)}")
+                try:
+                    await message.set_reaction([ReactionTypeEmoji("❌")])
+                except Exception:
+                    pass
                 return
 
         if final_msg is None:
@@ -697,7 +719,8 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     thread_id_regen,
                 )
             except Exception as exc:
-                await context.bot.send_message(chat_id_regen, text=f"Error: {exc}", message_thread_id=thread_id_regen)
+                logger.exception("Regen failed for thread %s", thread_id)
+                await context.bot.send_message(chat_id_regen, text=f"⚠️ {_classify_error(exc)}", message_thread_id=thread_id_regen)
                 return
         if final_msg is not None:
             kb = _make_reply_keyboard(thread_id, user_message, regen_node_id)
@@ -738,7 +761,8 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     resume_value=ans,
                 )
             except Exception as exc:
-                await context.bot.send_message(chat_id_ask, text=f"Error: {exc}", message_thread_id=thread_id_ask)
+                logger.exception("ask_reply resume failed for thread %s", thread_id)
+                await context.bot.send_message(chat_id_ask, text=f"⚠️ {_classify_error(exc)}", message_thread_id=thread_id_ask)
                 return
         if final_msg is not None:
             kb = _make_reply_keyboard(thread_id, ans, ask_node_id)
@@ -1248,10 +1272,13 @@ async def _post_init(app) -> None:  # type: ignore[type-arg]
         BotCommand("render",   "渲染 DAG 拓撲 SVG"),
         BotCommand("maintain", "整理 JSONL 索引"),
     ])
+    me = await app.bot.get_me()
+    print(f"Bot started: @{me.username}  |  logs → logs/bot.log")
 
 
 def main() -> None:
     """Start the Telegram bot."""
+    setup_logging()
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set in environment or .env file")

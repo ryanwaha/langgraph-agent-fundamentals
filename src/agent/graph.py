@@ -44,6 +44,10 @@ from agent.dag import Graph as _Graph
 
 _dag_cache: dict[str, _Graph] = {}
 
+# Per-invoke start time for duration tracking.
+# Key = invoke_id (LangGraph thread_id / ULID), set on first call_model entry.
+_turn_start: dict[str, datetime] = {}
+
 
 # ---------------------------------------------------------------------------
 # Structured output schema for the summarize node
@@ -63,8 +67,19 @@ class QASummary(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _write_tool_log(thread_id: str, node_id: str, tools: list[dict]) -> int:
-    """Append one tool-call log entry. Returns 1-based line number."""
+async def _write_turn_log(
+    thread_id: str,
+    node_id: str,
+    *,
+    ts_start: datetime,
+    ts_end: datetime,
+    model: str,
+    q: str,
+    a: str,
+    summary: str,
+    steps: list[dict],
+) -> int:
+    """Append one complete turn log entry. Returns 1-based line number."""
     log_path = LOG_DIR / f"{thread_id}.jsonl"
 
     def _sync_write() -> int:
@@ -76,8 +91,14 @@ async def _write_tool_log(thread_id: str, node_id: str, tools: list[dict]) -> in
             line_num = 1
         entry = {
             "node_id": node_id,
-            "ts": datetime.now(tz=UTC).isoformat(),
-            "tools": tools,
+            "ts_start": ts_start.isoformat(),
+            "ts_end": ts_end.isoformat(),
+            "duration_s": round((ts_end - ts_start).total_seconds(), 2),
+            "model": model,
+            "q": q,
+            "a": a,
+            "summary": summary,
+            "steps": steps,
         }
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -97,6 +118,9 @@ async def call_model(
     """Call the LLM powering the agent."""
     # Load DAG on first entry; reuse from cache on ReAct re-entries (after tools)
     dag_thread_id: str = config["configurable"]["dag_thread_id"]  # type: ignore[index]
+    invoke_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
+    if invoke_id not in _turn_start:
+        _turn_start[invoke_id] = datetime.now(tz=UTC)
     if dag_thread_id not in _dag_cache:
         jsonl_path = JSONL_DIR / f"{dag_thread_id}.jsonl"
         await asyncio.to_thread(JSONL_DIR.mkdir, parents=True, exist_ok=True)
@@ -152,29 +176,49 @@ async def summarize(
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
     dag_thread_id: str = config["configurable"]["dag_thread_id"]  # type: ignore[index]
+    invoke_id: str = config["configurable"]["thread_id"]  # type: ignore[index]
     dag_graph = _dag_cache[dag_thread_id]  # always populated by call_model
     jsonl_path = JSONL_DIR / f"{dag_thread_id}.jsonl"
 
-    # Extract tool calls with success/fail from ToolMessages
-    tool_msg_map: dict[str, ToolMessage] = {
-        m.tool_call_id: m
-        for m in state.messages
-        if isinstance(m, ToolMessage)
-    }
-    tools_used = []
+    ts_end = datetime.now(tz=UTC)
+    ts_start = _turn_start.pop(invoke_id, ts_end)
+
+    # Build a lookup: tool_call_id → (name, args) from all AIMessages
+    tc_meta: dict[str, tuple[str, dict]] = {}
     for msg in state.messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
-                tm = tool_msg_map.get(tc["id"])
-                ok = (getattr(tm, "status", "success") != "error") if tm else True
-                tools_used.append({"name": tc["name"], "input": tc["args"], "ok": ok})
+                tc_meta[tc["id"]] = (tc["name"], tc["args"])
+
+    # Reconstruct ordered ReAct step trace from message history
+    steps: list[dict] = []
+    llm_iter = 0
+    for msg in state.messages:
+        if isinstance(msg, AIMessage):
+            llm_iter += 1
+            step: dict = {"type": "llm", "iter": llm_iter}
+            if msg.tool_calls:
+                step["tools_requested"] = [tc["name"] for tc in msg.tool_calls]
+            steps.append(step)
+        elif isinstance(msg, ToolMessage):
+            name, args = tc_meta.get(msg.tool_call_id, ("unknown", {}))
+            ok = (getattr(msg, "status", "success") != "error")
+            output = str(msg.content)
+            steps.append({
+                "type": "tool",
+                "iter": llm_iter,
+                "name": name,
+                "input": args,
+                "output_preview": output[:300] if len(output) > 300 else output,
+                "ok": ok,
+            })
+
 
     # Pre-generate ULID so log entry and DAG node share the same ID
     node_id = generate_id()
-    log_ref = await _write_tool_log(dag_thread_id, node_id, tools_used) if tools_used else None
 
     # Generate summary
-    model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
+    summary_model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
     summary_prompt = (
         "Summarize the following Q-A exchange in ONE concise sentence. "
         "Capture the key question and the essence of the answer.\n\n"
@@ -182,7 +226,7 @@ async def summarize(
         f"Answer: {final_answer}"
     )
     try:
-        result = cast(QASummary, await model.ainvoke([{"role": "user", "content": summary_prompt}]))
+        result = cast(QASummary, await summary_model.ainvoke([{"role": "user", "content": summary_prompt}]))
         summary_text = result.summary
     except Exception:
         logger.warning(
@@ -191,6 +235,19 @@ async def summarize(
             exc_info=True,
         )
         summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
+
+    # Write complete turn log (always, not just when tools were used)
+    log_ref = await _write_turn_log(
+        dag_thread_id,
+        node_id,
+        ts_start=ts_start,
+        ts_end=ts_end,
+        model=runtime.context.model,
+        q=user_query,
+        a=final_answer,
+        summary=summary_text,
+        steps=steps,
+    )
 
     # Persist to DAG — use merge parents if set, then consume
     merge_parents = getattr(dag_graph, "_merge_parents", None)
