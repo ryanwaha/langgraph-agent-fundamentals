@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from markdown_it import MarkdownIt
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReactionTypeEmoji, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -290,28 +290,38 @@ def _md_to_html(text: str) -> str:
     return html_out.strip()
 
 
-def _truncate(text: str, limit: int = 4096) -> str:
-    return text[: limit - 3] + "..." if len(text) > limit else text
+# Phase 1 (TTFT draft) limits
+_P1_SOFT = 4000   # stop adding new content, start dot-padding
+_P1_HARD = 4090   # hard truncate + warning
+
+# Phase 2 (answer) split thresholds
+_P2_SPLIT_NL2 = 3800   # look back for \n\n
+_P2_SPLIT_NL  = 4000   # look back for \n
+_P2_HARD      = 4090   # hard cut + warning
 
 
-def _make_reply_keyboard(
-    thread_id: str, user_message: str, node_id: str | None
-) -> InlineKeyboardMarkup:
-    """Build the inline keyboard attached to every AI reply."""
-    buttons = [
-        InlineKeyboardButton(
-            "🔄 Regenerate",
-            callback_data={"a": "regen", "tid": thread_id, "q": user_message},
-        )
-    ]
-    if node_id:
-        buttons.append(
-            InlineKeyboardButton(
-                "🌿 Branch here",
-                callback_data={"a": "branch", "tid": thread_id, "nid": node_id},
-            )
-        )
-    return InlineKeyboardMarkup([buttons])
+def _split_answer(text: str) -> list[str]:
+    """Split answer text into Telegram-safe chunks with multi-level fallback."""
+    if len(text) <= _P2_SPLIT_NL2:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        if len(text) <= _P2_SPLIT_NL2:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n\n", 0, _P2_SPLIT_NL2)
+        if cut != -1:
+            chunks.append(text[:cut].rstrip())
+            text = text[cut:].lstrip()
+            continue
+        cut = text.rfind("\n", 0, _P2_SPLIT_NL)
+        if cut != -1:
+            chunks.append(text[:cut].rstrip())
+            text = text[cut:].lstrip()
+            continue
+        chunks.append(text[:_P2_HARD] + "\n⚠️ 已達字數上限")
+        text = text[_P2_HARD:]
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -583,20 +593,18 @@ async def run_agent_streaming(
     *,
     resume_value: str | None = None,
     merge_parents: list[str] | None = None,
-) -> tuple[Message | None, str | None]:
+) -> tuple[list[int], str | None]:
     """Stream agent execution via sendMessageDraft.
 
-    On normal completion returns (final_message, last_node_id).
+    On normal completion returns (sent_message_ids, last_node_id).
     If the agent interrupts (e.g. ask_user tool), sends the question to the
-    user and returns (None, None) — the invoke_id is stored in _pending_invoke
+    user and returns ([], None) — the invoke_id is stored in _pending_invoke
     so the next user reply resumes it.
 
-    Args:
-        user_message:   Original user text (used for the draft header).
-        dag_thread_id:  Telegram thread ID — keys the JSONL/DAG files.
-        invoke_id:      Per-invoke ULID — keys the LangGraph checkpointer.
-        resume_value:   If set, resumes a paused interrupt instead of new invoke.
-        merge_parents:  DAG parent IDs for /merge, forwarded via configurable.
+    Phases:
+      Phase 1 (TTFT): raw steps/thinking streamed via draft, no processing.
+      Phase 2 (answer): steps compressed to blockquote, answer streamed via draft.
+      Final: answer sent as real message(s), formula PNGs appended.
     """
     configurable: dict = {"thread_id": invoke_id, "dag_thread_id": dag_thread_id}
     if merge_parents:
@@ -609,34 +617,124 @@ async def run_agent_streaming(
         else InputState(messages=[HumanMessage(content=user_message)])
     )
 
-    header = f"💬 <b>用戶說：</b>{_h(user_message[:100])}"
-    steps: list[str] = []
-    current_query: str | None = None
-    answer_buf = ""
-    thinking_buf = ""
+    # --- State ---
+    steps: list[str] = []          # raw phase-1 lines; compressed in phase 2
+    thinking_buf: str = ""
     thinking_step_idx: int = -1
+    answer_buf: str = ""           # current answer segment
+    phase: int = 1                 # 1 = TTFT, 2 = answer streaming
+    p1_truncated: bool = False
+    sent_messages: list[int] = []
+    current_query: str | None = None
     last_node_id: str | None = None
+    dot_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
-    def _build(extra: str = "") -> str:
-        parts = [header]
-        if steps:
-            steps_block = "\n".join(steps)
-            parts.append(f"<blockquote expandable>{steps_block}</blockquote>")
-        if extra:
-            parts.append(extra)
-        return _truncate("\n\n".join(parts))
+    # --- Draft debounce ---
+    # send_message_draft is rate-limited. Buffer the latest text and flush at
+    # most once per _DRAFT_INTERVAL seconds to stay under Telegram flood limits.
+    _DRAFT_INTERVAL = 1.0
+    _draft_buf: list[str] = [""]   # mutable cell: [latest_text]
+    _draft_flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
+    _draft_flush_task_holder: list = [None]
 
-    async def _draft(text: str) -> None:
-        try:
-            await bot.send_message_draft(  # type: ignore[attr-defined]
+    async def _flush_loop() -> None:
+        while True:
+            await asyncio.sleep(_DRAFT_INTERVAL)
+            text = _draft_buf[0]
+            if not text:
+                continue
+            try:
+                await bot.send_message_draft(  # type: ignore[attr-defined]
+                    chat_id,
+                    draft_id=1,
+                    text=text,
+                    message_thread_id=message_thread_id,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                logger.debug("send_message_draft failed (suppressed)")
+
+    _draft_flush_task_holder[0] = asyncio.create_task(_flush_loop())
+
+    def _draft(text: str) -> None:
+        """Queue text for the next draft flush (non-blocking)."""
+        _draft_buf[0] = text
+
+    async def _draft_stop() -> None:
+        """Cancel flush loop and send one final draft."""
+        t = _draft_flush_task_holder[0]
+        if t and not t.done():
+            t.cancel()
+        _draft_buf[0] = ""
+
+    def _p1_draft() -> str:
+        text = "\n".join(steps)
+        if len(text) >= _P1_HARD:
+            return text[:_P1_HARD - 12] + "\n⚠️ 已達預覽上限"
+        return text
+
+    async def _dot_pad() -> None:
+        nonlocal p1_truncated
+        while True:
+            await asyncio.sleep(1)
+            content = "\n".join(steps)
+            if len(content) >= _P1_HARD:
+                p1_truncated = True
+                _draft(_p1_draft())
+                return
+            if steps:
+                steps[-1] = steps[-1] + "."
+            _draft(_p1_draft())
+
+    def _maybe_start_dot_task() -> asyncio.Task | None:  # type: ignore[type-arg]
+        if not p1_truncated and len("\n".join(steps)) >= _P1_SOFT:
+            return asyncio.create_task(_dot_pad())
+        return None
+
+    def _compress_steps() -> str:
+        """Compress raw steps into a single <blockquote expandable> for phase 2."""
+        summary_lines: list[str] = []
+        for s in steps:
+            if s.startswith("✅"):
+                summary_lines.append(s.split("\n")[0])
+        if thinking_buf:
+            heading = re.search(r"^##\s+(.+)$", thinking_buf, re.MULTILINE)
+            if heading:
+                thought = heading.group(1).strip()
+            else:
+                parts = thinking_buf.split("\n\n")
+                first = parts[0].strip() if parts else ""
+                m = re.search(r"[^。.!?！？]+[。.!?！？]?", first)
+                thought = m.group(0).strip() if m else ""
+            if thought:
+                summary_lines.append(f"🧠 {_h(thought)}")
+            else:
+                summary_lines.append(f"🧠 已推理（{len(thinking_buf)} 字）")
+        if not summary_lines:
+            return ""
+        inner = "\n".join(summary_lines)
+        return f"<blockquote expandable>{inner}</blockquote>"
+
+    def _p2_draft(answer_html: str) -> str:
+        summary = _compress_steps()
+        parts = [p for p in [summary, answer_html] if p]
+        return "\n\n".join(parts)
+
+    async def _send_segment(answer_html: str) -> None:
+        """send_message the current blockquote+answer segment; append ids."""
+        summary = _compress_steps()
+        parts = [p for p in [summary, answer_html] if p]
+        full = "\n\n".join(parts)
+        for chunk in _split_answer(full):
+            msg = await bot.send_message(  # type: ignore[attr-defined]
                 chat_id,
-                draft_id=1,
-                text=text,
+                text=chunk,
                 message_thread_id=message_thread_id,
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            logger.exception("send_message_draft failed")
+            sent_messages.append(msg.message_id)
+
+    # --- Event loop ---
 
     async for event in graph.astream_events(
         input_data,
@@ -651,32 +749,65 @@ async def run_agent_streaming(
             answer_buf = ""
             thinking_buf = ""
             thinking_step_idx = -1
-            await _draft(_build("🤔 正在思考..."))
+            _draft(_p1_draft() or "🤔 正在思考...")
 
         elif evt == "on_tool_start":
             tool_name: str = event["name"]
             tool_input: dict = event["data"].get("input") or {}
             label = _TOOL_LABELS.get(tool_name, tool_name)
+
+            if phase == 2 and answer_buf.strip():
+                # Finalize current answer segment before new tool call
+                if dot_task:
+                    dot_task.cancel()
+                await _send_segment(_md_to_html(answer_buf))
+                answer_buf = ""
+                steps.clear()
+
             if tool_name == "search":
                 current_query = str(tool_input.get("query", ""))
                 steps.append(f"⏳ 正在{label}：「{_h(current_query[:60])}」")
             else:
                 current_query = None
                 steps.append(f"⏳ 正在執行：{_h(label)}")
-            await _draft(_build())
+
+            if phase == 1:
+                dot_task = _maybe_start_dot_task()
+                _draft(_p1_draft())
+            else:
+                _draft(_p2_draft(""))
 
         elif evt == "on_tool_end":
             tool_name = event["name"]
             label = _TOOL_LABELS.get(tool_name, tool_name)
+            tool_output = event["data"].get("output")
+
             for i in range(len(steps) - 1, -1, -1):
                 if steps[i].startswith("⏳"):
                     if tool_name == "search" and current_query:
-                        steps[i] = f"✅ 已{label}：「{_h(current_query[:60])}」"
+                        # Phase 1: include URLs; phase 2: _compress_steps() drops them
+                        result_urls: list[str] = []
+                        if isinstance(tool_output, list):
+                            for r in tool_output:
+                                url = r.get("url") if isinstance(r, dict) else None
+                                if url:
+                                    result_urls.append(url)
+                        url_lines = "".join(f"\n  • {u}" for u in result_urls[:5])
+                        steps[i] = f"✅ 已{label}：「{_h(current_query[:60])}」{url_lines}"
                     else:
                         steps[i] = steps[i].replace("⏳ 正在", "✅ 已完成", 1)
                     break
             current_query = None
-            await _draft(_build())
+
+            if dot_task and not dot_task.done():
+                dot_task.cancel()
+                dot_task = None
+            dot_task = _maybe_start_dot_task()
+
+            if phase == 1:
+                _draft(_p1_draft())
+            else:
+                _draft(_p2_draft(_md_to_html(answer_buf)))
 
         elif evt == "on_chat_model_stream" and node == "call_model":
             chunk = event["data"].get("chunk")
@@ -693,21 +824,33 @@ async def run_agent_streaming(
                             steps.append("🧠 正在推理...")
                             thinking_step_idx = len(steps) - 1
                         thinking_buf += btext
-                        steps[thinking_step_idx] = f"🧠 正在推理（{len(thinking_buf)} 字）..."
-                        await _draft(_build())
-                    else:
                         if thinking_step_idx >= 0:
-                            preview = _h(thinking_buf[:300])
-                            suffix = "..." if len(thinking_buf) > 300 else ""
-                            steps[thinking_step_idx] = f"🧠 {preview}{suffix}"
-                            thinking_step_idx = -1
+                            steps[thinking_step_idx] = f"🧠 正在推理（{len(thinking_buf)} 字）..."
+                        if phase == 1:
+                            if dot_task is None:
+                                dot_task = _maybe_start_dot_task()
+                            if not p1_truncated:
+                                _draft(_p1_draft())
+                    else:
+                        if phase == 1:
+                            # Transition to phase 2
+                            if dot_task:
+                                dot_task.cancel()
+                                dot_task = None
+                            # Finalize thinking step display
+                            if thinking_step_idx >= 0:
+                                thinking_step_idx = -1
+                            phase = 2
                         answer_buf += btext
-                        await _draft(_build(_md_to_html(answer_buf)))
+                        _draft(_p2_draft(_md_to_html(answer_buf)))
 
         elif evt == "on_chain_end" and node == "":
-            # Top-level graph completion: capture last_node_id from output state
             output = event["data"].get("output") or {}
             last_node_id = output.get("last_node_id") or last_node_id
+
+    # Cancel any lingering dot task
+    if dot_task and not dot_task.done():
+        dot_task.cancel()
 
     # Check if the graph paused at an interrupt (e.g. ask_user tool)
     state = await graph.aget_state(config)
@@ -741,22 +884,18 @@ async def run_agent_streaming(
                 message_thread_id=message_thread_id,
                 parse_mode=ParseMode.HTML,
             )
+        await _draft_stop()
         _pending_invoke[dag_thread_id] = invoke_id
-        return None, None
+        return [], None
 
+    await _draft_stop()
+
+    # Send final answer segment
     final_answer = answer_buf.strip()
     _, block_formulas = _extract_block_math(final_answer)
-    final_text = (
-        _build(_md_to_html(final_answer))
-        if final_answer
-        else _build("(無回應)")
-    )
-    final_msg: Message = await bot.send_message(  # type: ignore[attr-defined]
-        chat_id,
-        text=final_text,
-        message_thread_id=message_thread_id,
-        parse_mode=ParseMode.HTML,
-    )
+    answer_html = _md_to_html(final_answer) if final_answer else "(無回應)"
+    await _send_segment(answer_html)
+
     for formula in block_formulas:
         try:
             buf = _render_formula_png(formula)
@@ -767,7 +906,8 @@ async def run_agent_streaming(
             )
         except Exception:
             logger.exception("Failed to render formula: %s", formula[:80])
-    return final_msg, last_node_id
+
+    return sent_messages, last_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -814,15 +954,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         existing.cancel()
 
     async def _run() -> None:
-        # Debounce window: if another message arrives within 800 ms, this task
-        # will be cancelled before the sleep completes.
-        await asyncio.sleep(0.8)
-
-        # React 👀 to acknowledge receipt
+        # React 👀 immediately to acknowledge receipt
         try:
             await message.set_reaction([ReactionTypeEmoji("👀")])
         except Exception:
             pass
+
+        # Debounce window: if another message arrives within 800 ms, this task
+        # will be cancelled before the sleep completes.
+        await asyncio.sleep(0.8)
 
         # /merge pending: pass parent IDs via configurable to graph.py
         pending_merge = _pending_merges.pop(dag_thread_id, None)
@@ -838,7 +978,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         async with _thread_locks[dag_thread_id]:
             try:
-                final_msg, node_id = await run_agent_streaming(
+                msg_ids, node_id = await run_agent_streaming(
                     user_text,
                     dag_thread_id,
                     invoke_id,
@@ -857,20 +997,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-        if final_msg is None:
+        if not msg_ids:
             # Agent interrupted — question already sent; show a thinking reaction
             try:
                 await message.set_reaction([ReactionTypeEmoji("🤔")])
             except Exception:
                 pass
             return
-
-        # Attach inline keyboard (Regenerate / Branch here)
-        kb = _make_reply_keyboard(dag_thread_id, user_text, node_id)
-        try:
-            await final_msg.edit_reply_markup(reply_markup=kb)
-        except Exception:
-            pass
 
         # React ✅ on success
         try:
@@ -888,7 +1021,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard button presses (Regenerate / Branch here)."""
+    """Handle inline keyboard button presses."""
     query = update.callback_query
     if query is None:
         return
@@ -898,40 +1031,7 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     action = data.get("a")
     thread_id: str = data.get("tid", "")
 
-    if action == "regen":
-        user_message: str = data.get("q", "")
-        if not user_message or not thread_id:
-            return
-        old_msg = query.message
-        chat_id_regen: int = old_msg.chat_id
-        thread_id_regen: int | None = old_msg.message_thread_id
-        try:
-            await old_msg.delete()
-        except Exception:
-            pass
-        invoke_id_regen = generate_id()
-        async with _thread_locks[thread_id]:
-            try:
-                final_msg, regen_node_id = await run_agent_streaming(
-                    user_message,
-                    thread_id,
-                    invoke_id_regen,
-                    context.bot,
-                    chat_id_regen,
-                    thread_id_regen,
-                )
-            except Exception as exc:
-                logger.exception("Regen failed for thread %s", thread_id)
-                await context.bot.send_message(chat_id_regen, text=f"⚠️ {_classify_error(exc)}", message_thread_id=thread_id_regen)
-                return
-        if final_msg is not None:
-            kb = _make_reply_keyboard(thread_id, user_message, regen_node_id)
-            try:
-                await final_msg.edit_reply_markup(reply_markup=kb)
-            except Exception:
-                pass
-
-    elif action == "ask_reply":
+    if action == "ask_reply":
         # Resume a paused ask_user interrupt from an inline button tap
         iid: str = data.get("iid", "")
         ans: str = data.get("ans", "")
@@ -953,7 +1053,7 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pass
         async with _thread_locks[thread_id]:
             try:
-                final_msg, ask_node_id = await run_agent_streaming(
+                await run_agent_streaming(
                     ans,
                     thread_id,
                     iid,
@@ -966,32 +1066,6 @@ async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 logger.exception("ask_reply resume failed for thread %s", thread_id)
                 await context.bot.send_message(chat_id_ask, text=f"⚠️ {_classify_error(exc)}", message_thread_id=thread_id_ask)
                 return
-        if final_msg is not None:
-            kb = _make_reply_keyboard(thread_id, ans, ask_node_id)
-            try:
-                await final_msg.edit_reply_markup(reply_markup=kb)
-            except Exception:
-                pass
-
-    elif action == "branch":
-        node_id: str = data.get("nid", "")
-        if not node_id or not thread_id:
-            return
-        jsonl_path = _jsonl_path(thread_id)
-        if not jsonl_path.exists():
-            await query.answer("No history found.", show_alert=True)
-            return
-        dag_graph = load(jsonl_path)
-        target_id, err = _match_node(dag_graph, node_id)
-        if err:
-            await query.answer(err, show_alert=True)
-            return
-        try:
-            switch_active(dag_graph, jsonl_path, target_id)
-            write_session(dag_graph, jsonl_path)
-            await query.answer(f"✅ Branched to {target_id[:8]}", show_alert=False)
-        except Exception as exc:
-            await query.answer(f"Error: {exc}", show_alert=True)
 
     elif action == "v":
         op = data.get("op")
@@ -1196,41 +1270,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"thread: {thread_id}\nnodes: {len(dag_graph.nodes)}\nactive: {active}"
     )
 
-
-async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /show -- show the active node's path to root."""
-    if update.message is None:
-        return
-
-    thread_id = _thread_id(update.message)
-    jsonl_path = _jsonl_path(thread_id)
-
-    if not jsonl_path.exists():
-        await update.message.reply_text("No conversation history yet.")
-        return
-
-    dag_graph = load(jsonl_path)
-
-    if dag_graph.active_node is None:
-        await update.message.reply_text("No active node.")
-        return
-
-    nodes = dag_graph.path_to_root(dag_graph.active_node)
-    if not nodes:
-        await update.message.reply_text("(active path is empty)")
-        return
-
-    lines: list[str] = []
-    for node in nodes:
-        lines.append(f"[{node.id[:8]}] Q: {node.q}")
-        if node.a:
-            lines.append(f"         A: {node.a[:120]}{'...' if len(node.a) > 120 else ''}")
-
-    response = "\n".join(lines)
-    if len(response) > 4096:
-        response = response[:4093] + "..."
-
-    await update.message.reply_text(response)
 
 
 async def cmd_paths(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1478,7 +1517,6 @@ async def _post_init(app) -> None:  # type: ignore[type-arg]
         BotCommand("switch",      "/branch 別名"),
         BotCommand("list",        "列出最近的對話節點"),
         BotCommand("status",      "顯示目前會話狀態"),
-        BotCommand("show",        "顯示當前節點到根的路徑"),
         BotCommand("paths",       "顯示所有分支路徑"),
         BotCommand("view",        "互動式節點瀏覽器"),
         BotCommand("merge",       "合併分支（選定父節點後發送問句）"),
@@ -1522,7 +1560,6 @@ def main() -> None:
     app.add_handler(CommandHandler("switch",   cmd_switch))
     app.add_handler(CommandHandler("list",     cmd_list))
     app.add_handler(CommandHandler("status",   cmd_status))
-    app.add_handler(CommandHandler("show",     cmd_show))
     app.add_handler(CommandHandler("paths",    cmd_paths))
     app.add_handler(CommandHandler("view",     cmd_view))
     app.add_handler(CommandHandler("merge",    cmd_merge))
