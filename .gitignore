@@ -47,3 +47,6 @@ Thumbs.db
 
 # DAG conversation data
 jsonls/
+
+# Runtime tool-call logs (contain user conversation content)
+logs/
