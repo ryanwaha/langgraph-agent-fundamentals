@@ -1,3 +1,6 @@
 [submodule "src/jsonl-dag-engine"]
 	path = src/jsonl-dag-engine
 	url = https://github.com/ryanwaha/JSONL-DAG-engine.git
+[submodule "src/lossless_compressor"]
+	path = src/lossless_compressor
+	url = https://github.com/ryanwaha/Lossless_Semantic_Compression_Engine.git

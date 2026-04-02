@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Discord bot | 🟡 Disabled | `DISCORD_BOT_TOKEN=null` in `.env`; no DAG integration |
 | LangGraph Studio | ✅ Ready | `langgraph dev` works |
 | jsonl-dag-engine | ✅ Populated | git submodule at `src/jsonl-dag-engine/`, branch `feat/log-ref-node-id` (commit `6e8b14b`) |
+| lossless_compressor | ✅ Submodule | git submodule at `src/lossless_compressor/` (github: ryanwaha/Lossless_Semantic_Compression_Engine); adapter at `src/agent/compression/graph.py` |
 | Checkpointer | ✅ InMemorySaver | Used for HITL interrupt/resume via `Command(resume=...)` |
 
 ## Environment
@@ -17,6 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Conda env**: `base` (WSL) — `/home/ryanwh/miniconda3/bin/python`
 - **Python**: `3.13`, path `/home/ryanwh/miniconda3/bin/python`
 - **Package layout**: `src/agent/` is the importable `agent` package (configured in `pyproject.toml` + `pyrightconfig.json`)
+- **Submodule path**: `src/lossless_compressor/` — add `src/lossless_compressor` to `PYTHONPATH` when running outside `langgraph dev` (e.g. `PYTHONPATH=src:src/lossless_compressor`)
 
 ## Running the project
 

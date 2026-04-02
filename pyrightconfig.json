@@ -1,3 +1,3 @@
 {
-  "extraPaths": ["src", "src/jsonl-dag-engine"]
+  "extraPaths": ["src", "src/jsonl-dag-engine", "src/lossless_compressor"]
 }
