@@ -18,20 +18,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Conda env**: `base` (WSL) — `/home/ryanwh/miniconda3/bin/python`
 - **Python**: `3.13`, path `/home/ryanwh/miniconda3/bin/python`
 - **Package layout**: `src/agent/` is the importable `agent` package (configured in `pyproject.toml` + `pyrightconfig.json`)
-- **Submodule path**: `src/lossless_compressor/` — add `src/lossless_compressor` to `PYTHONPATH` when running outside `langgraph dev` (e.g. `PYTHONPATH=src:src/lossless_compressor`)
+- **Submodule path**: `src/lossless_compressor/` — registered via `pip install -e .`; no PYTHONPATH needed
 
 ## Running the project
 
 ```bash
+# One-time setup (registers agent + lossless_compressor as editable installs)
+pip install -e .
+
 # Start LangGraph Studio (test agent without Discord)
 langgraph dev --no-browser
 # Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
 
 # Start Discord bot
-PYTHONPATH=src python -m bot.discord_bot
+python -m bot.discord_bot
 
 # Start Telegram bot
-PYTHONPATH=src python -m bot.telegram_bot
+python -m bot.telegram_bot
 ```
 
 > **Windows encoding**: `.env` must use ASCII-only comments (no em dashes `—`). The `langgraph dev` dotenv parser uses the system codepage (cp950 on this machine).
