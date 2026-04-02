@@ -34,7 +34,7 @@ from langgraph.types import Command
 from agent.context import Context
 from agent.logging_config import setup_logging
 from agent.dag import Graph, Node, append_node, delete_node, generate_id, load, maintain, render_topology_png, switch_active, write_session
-from agent.graph import cancel_session_flusher, flush_all_sessions, flush_session, graph, start_session_flusher
+from agent.graph import cancel_session_flusher, drain_compression_tasks, flush_all_sessions, flush_session, graph, start_session_flusher
 from agent.state import InputState
 from agent.utils import get_message_text
 
@@ -1633,6 +1633,7 @@ async def _post_init(app) -> None:  # type: ignore[type-arg]
 async def _post_shutdown(app) -> None:  # type: ignore[type-arg]
     """Flush all open sessions on graceful shutdown."""
     cancel_session_flusher()
+    await drain_compression_tasks(timeout=30.0)  # wait for in-flight compressions before session flush
     await flush_all_sessions()
     logger.info("All sessions flushed on shutdown")
 

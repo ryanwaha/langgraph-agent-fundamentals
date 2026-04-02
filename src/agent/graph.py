@@ -16,7 +16,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
-from pydantic import BaseModel, Field
 
 from agent.context import Context
 from agent.dag import (
@@ -52,19 +51,6 @@ _turn_start: dict[str, datetime] = {}
 # A session is flushed (write_session + evict cache) after SESSION_TIMEOUT_S of inactivity.
 _last_activity: dict[str, datetime] = {}
 SESSION_TIMEOUT_S = 600  # 10 minutes
-
-
-# ---------------------------------------------------------------------------
-# Structured output schema for the summarize node
-# ---------------------------------------------------------------------------
-
-
-class QASummary(BaseModel):
-    """Structured output for Q-A summarization."""
-
-    summary: str = Field(
-        description="A single concise sentence summarizing the Q-A exchange."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +161,23 @@ async def call_model(
 async def summarize(
     state: State, runtime: Runtime[Context], config: RunnableConfig
 ) -> Dict[str, str]:
-    """Summarize the Q-A exchange and persist to DAG."""
+    """Schedule compression in background and return immediately.
+
+    Main path (this function):
+    - Extracts turn metadata (no LLM calls)
+    - Updates in-memory DAG state synchronously (active_node, _last_activity)
+    - Snapshots and consumes merge_parents to avoid race with the next turn
+    - Schedules _compress_and_persist as a background asyncio.Task
+    - Returns immediately so the graph can end and the bot can accept the next message
+
+    Background task (_compress_and_persist):
+    - Runs the L1→L2 compression subgraph to produce sum_text
+    - Writes the turn log (log_ref)
+    - Calls append_node to persist the JSONL record
+
+    Invariant: dag_graph.active_node is always updated before this function returns,
+    so any subsequent call_model entry for the same thread sees the correct parent.
+    """
     user_query = get_message_text(state.messages[0])
     final_answer = get_message_text(state.messages[-1])
     dag_thread_id: str = config["configurable"]["dag_thread_id"]  # type: ignore[index]
@@ -205,7 +207,7 @@ async def summarize(
             steps.append(step)
         elif isinstance(msg, ToolMessage):
             name, args = tc_meta.get(msg.tool_call_id, ("unknown", {}))
-            ok = (getattr(msg, "status", "success") != "error")
+            ok = getattr(msg, "status", "success") != "error"
             output = str(msg.content)
             steps.append({
                 "type": "tool",
@@ -216,63 +218,64 @@ async def summarize(
                 "ok": ok,
             })
 
-
     # Pre-generate ULID so log entry and DAG node share the same ID
     node_id = generate_id()
 
-    # Generate summary
-    summary_model = load_chat_model(runtime.context.model).with_structured_output(QASummary)
-    summary_prompt = (
-        "Summarize the following Q-A exchange in ONE concise sentence. "
-        "Capture the key question and the essence of the answer.\n\n"
-        f"Question: {user_query}\n\n"
-        f"Answer: {final_answer}"
-    )
-    try:
-        result = cast(QASummary, await summary_model.ainvoke([{"role": "user", "content": summary_prompt}]))
-        summary_text = result.summary
-    except Exception:
-        logger.warning(
-            "summarize: LLM call failed for thread %s, falling back to truncated query",
-            dag_thread_id,
-            exc_info=True,
-        )
-        summary_text = user_query[:100] + ("..." if len(user_query) > 100 else "")
-
-    # Write complete turn log (always, not just when tools were used)
-    log_ref = await _write_turn_log(
-        dag_thread_id,
-        node_id,
-        ts_start=ts_start,
-        ts_end=ts_end,
-        model=runtime.context.model,
-        q=user_query,
-        summary=summary_text,
-        steps=steps,
-    )
-
-    # Persist to DAG — use merge parents if set, then consume
+    # Snapshot and consume merge_parents synchronously.
+    # Must happen before returning: the next turn's call_model reads active_node
+    # from the same dag_graph object, and we cannot leave _merge_parents set.
     merge_parents = getattr(dag_graph, "_merge_parents", None)
     if merge_parents:
-        parents = merge_parents
+        parents: list[str] = list(merge_parents)
         del dag_graph._merge_parents  # type: ignore[attr-defined]
     else:
         parents = [dag_graph.active_node] if dag_graph.active_node else []
-    new_node = await asyncio.to_thread(
-        append_node,
-        dag_graph,
-        jsonl_path,
-        q=user_query,
-        a=final_answer,
-        sum_text=summary_text,
-        parents=parents,
-        node_id=node_id,
-        log_ref=log_ref,
-    )
-    dag_graph.active_node = new_node.id
+
+    # Update in-memory DAG pointer immediately (before scheduling background work).
+    dag_graph.active_node = node_id
     _last_activity[dag_thread_id] = datetime.now(tz=UTC)
 
-    return {"summary": summary_text, "last_node_id": node_id}
+    # Snapshot model name before the async gap (runtime may not be accessible later).
+    model_name: str = runtime.context.model
+
+    # ---------------------------------------------------------------------------
+    # Background task: compression + JSONL persistence
+    # ---------------------------------------------------------------------------
+
+    async def _compress_and_persist() -> None:
+        # Deferred import: keeps langchain_ollama out of startup if not yet installed.
+        from agent.compression import run_compression
+
+        sum_text = await run_compression(user_query, final_answer, node_id=node_id)
+
+        log_ref = await _write_turn_log(
+            dag_thread_id,
+            node_id,
+            ts_start=ts_start,
+            ts_end=ts_end,
+            model=model_name,
+            q=user_query,
+            summary=sum_text,
+            steps=steps,
+        )
+        await asyncio.to_thread(
+            append_node,
+            dag_graph,
+            jsonl_path,
+            q=user_query,
+            a=final_answer,
+            sum_text=sum_text,
+            parents=parents,
+            node_id=node_id,
+            log_ref=log_ref,
+        )
+
+    task = asyncio.create_task(
+        _compress_and_persist(), name=f"compress-{node_id[:8]}"
+    )
+    _register_compression_task(task)
+
+    return {"summary": "", "last_node_id": node_id}
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +317,42 @@ async def _session_watchdog() -> None:
 
 
 _watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
+
+# Background compression tasks: one per Q-A turn, short-lived.
+# Automatically removed from the set when they complete.
+_compression_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+
+
+def _register_compression_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
+    """Track a compression task; discard from set automatically on completion."""
+    _compression_tasks.add(task)
+    task.add_done_callback(_compression_tasks.discard)
+
+
+async def drain_compression_tasks(timeout: float = 30.0) -> None:
+    """Wait for all in-flight compression tasks to finish.
+
+    Called during graceful shutdown, before flush_all_sessions(), to ensure
+    append_node() completes before write_session() reads the DAG.
+
+    Tasks still pending after `timeout` seconds are cancelled (not awaited),
+    so shutdown always proceeds. Exceptions from individual tasks are logged
+    but not re-raised.
+    """
+    if not _compression_tasks:
+        return
+    pending_list = list(_compression_tasks)
+    logger.info("drain_compression_tasks: waiting for %d task(s)", len(pending_list))
+    done, still_pending = await asyncio.wait(pending_list, timeout=timeout)
+    for task in still_pending:
+        task.cancel()
+        logger.warning(
+            "drain_compression_tasks: cancelled timed-out task %s", task.get_name()
+        )
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            logger.error("drain_compression_tasks: task raised %r", exc)
 
 
 def start_session_flusher() -> None:
